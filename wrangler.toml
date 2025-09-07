@@ -2,6 +2,10 @@ name = "thirdpartyrisk"
 main = "src/index.js"
 compatibility_date = "2025-09-06"
 
+# wrangler.toml (wrangler v3.88.0^)
+[observability.logs]
+enabled = true
+
 # Optional: turn on Access gating for API routes (set to "1" to require Cf-Access)
 [vars]
 REQUIRE_ACCESS = "0"
