@@ -50,8 +50,13 @@ export default {
 
 async function getVendorScore(apiKey, hostname) {
   const endpoint = `https://cyber-risk.upguard.com/api/public/vendor?hostname=${encodeURIComponent(hostname)}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
   try {
-    const r = await fetch(endpoint, { headers: { Authorization: apiKey } });
+    const r = await fetch(endpoint, {
+      headers: { Authorization: apiKey },
+      signal: controller.signal,
+    });
     if (!r.ok) {
       const body = await r.text();
       return { hostname, ok: false, status: r.status, error: body || "Request failed" };
@@ -65,7 +70,12 @@ async function getVendorScore(apiKey, hostname) {
       updatedAt: data.updated_at || null,
     };
   } catch (e) {
+    if (e.name === "AbortError") {
+      return { hostname, ok: false, status: 0, error: "Request timed out" };
+    }
     return { hostname, ok: false, status: 0, error: e && e.message ? e.message : String(e) };
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
