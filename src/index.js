@@ -1,7 +1,13 @@
 // src/index.js — Flashy UI version
 // Cloudflare Worker: UpGuard score dashboard with enhanced UI
 
-const DEFAULT_DOMAINS = ["topsfield-ma.gov", "middletonma.gov", "danversma.gov", "essexma.org", "hamiltonma.gov", "wenhamma.gov"]; // add more any time
+const DEFAULT_DOMAINS = ["topsfield-ma.gov",
+                         "middletonma.gov",
+                         "danversma.gov",
+                         "essexma.org",
+                         "hamiltonma.gov",
+                         "wenhamma.gov"
+                        ]; // add more any time
 
 export default {
   async fetch(req, env, ctx) {
