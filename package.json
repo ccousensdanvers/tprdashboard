@@ -1,0 +1,14 @@
+{
+  "name": "thirdpartyrisk-dashboard",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Cloudflare Worker: UpGuard score dashboard",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy:staging": "wrangler deploy --env staging",
+    "deploy:production": "wrangler deploy --env production"
+  },
+  "devDependencies": {
+    "wrangler": "^3.81.0"
+  }
+}
