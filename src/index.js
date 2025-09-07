@@ -180,26 +180,24 @@ function renderPage() {
   <header>
     <div class="header-inner">
       <h1 class="app-title">Collaborative Security Dashboard</h1>
-      <div class="sub">Live UpGuard vendor scores across participating municipalities. Add domains below and refresh.</div>
+      <div class="sub">Live UpGuard vendor scores across participating vendors.</div>
     </div>
   </header>
 
   <section class="panel">
     <div class="toolbar">
-      <input id="vendors" class="input" type="text" placeholder="Add vendors: example.com, city.gov" />
       <select id="sort" class="input" style="min-width:160px;">
         <option value="desc">Sort: Highest score</option>
         <option value="asc">Sort: Lowest score</option>
         <option value="alpha">Sort: A–Z</option>
       </select>
       <button id="refresh" class="btn btn-primary">Refresh</button>
-      <button id="reset" class="btn btn-ghost">Reset</button>
     </div>
     <div id="grid" class="grid"></div>
   </section>
 
   <footer>
-    Tip: Bookmark with a query string like <code>?vendors=arcticwolf.com,cai-tech.com</code> to preload a custom list.
+    Data provided by UpGuard.
   </footer>
 
   <script>
@@ -238,24 +236,10 @@ function renderPage() {
       "onec1.com",
       "permiteyes.com",
       "workeasysoftware.com",
-    ]; // server keeps same default
-    var grid = document.getElementById('grid');
-    var input = document.getElementById('vendors');
-    var sortSel = document.getElementById('sort');
-    var btn = document.getElementById('refresh');
-    var reset = document.getElementById('reset');
-
-    function getQueryVendors() {
-      var p = new URLSearchParams(location.search).get('vendors');
-      if (!p) return null;
-      return Array.from(new Set(p.split(',').map(function(s){ return s.trim(); }).filter(Boolean)));
-    }
-
-    function parseVendors() {
-      var raw = (input.value || '').trim();
-      if (!raw) return DEFAULTS.slice();
-      return Array.from(new Set(raw.split(',').map(function(s){ return s.trim(); }).filter(Boolean)));
-    }
+      ]; // server keeps same default
+      var grid = document.getElementById('grid');
+      var sortSel = document.getElementById('sort');
+      var btn = document.getElementById('refresh');
 
     function pct(score) { // assume 0..1000 scale
       if (typeof score !== 'number') return 0;
@@ -356,22 +340,17 @@ function renderPage() {
       sorted.forEach(function(r){ grid.appendChild(cardNode(r)); });
     }
 
-    function load() {
-      var list = parseVendors();
-      var qs = encodeURIComponent(list.join(','));
-      fetch('/api/scores?vendors=' + qs)
-        .then(function(res){ return res.json(); })
-        .then(function(data){ render(data.vendors || []); })
-        .catch(function(e){ render([{ hostname: 'dashboard', ok: false, status: 0, error: (e && e.message) ? e.message : String(e) }]); });
-    }
+      function load() {
+        var list = DEFAULTS.slice();
+        var qs = encodeURIComponent(list.join(','));
+        fetch('/api/scores?vendors=' + qs)
+          .then(function(res){ return res.json(); })
+          .then(function(data){ render(data.vendors || []); })
+          .catch(function(e){ render([{ hostname: 'dashboard', ok: false, status: 0, error: (e && e.message) ? e.message : String(e) }]); });
+      }
 
-    btn.onclick = load;
-    reset.onclick = function(){ input.value = DEFAULTS.join(','); load(); };
-
-    // initialize input from query or defaults
-    var initial = getQueryVendors();
-    input.value = (initial && initial.length ? initial : DEFAULTS).join(',');
-    window.addEventListener('DOMContentLoaded', load);
+      btn.onclick = load;
+      window.addEventListener('DOMContentLoaded', load);
   </script>
 </body>
 </html>`;
