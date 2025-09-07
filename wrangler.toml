@@ -1,0 +1,16 @@
+name = "thirdpartyrisk"
+main = "src/index.js"
+compatibility_date = "2025-09-06"
+
+# Optional: turn on Access gating for API routes (set to "1" to require Cf-Access)
+[vars]
+REQUIRE_ACCESS = "0"
+
+[env.staging]
+# Keep same entry file; secrets are environment-specific
+[env.staging.vars]
+REQUIRE_ACCESS = "0"
+
+[env.production]
+[env.production.vars]
+REQUIRE_ACCESS = "0"
