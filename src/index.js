@@ -1,13 +1,42 @@
 // src/index.js — Flashy UI version
 // Cloudflare Worker: UpGuard score dashboard with enhanced UI
 
-const DEFAULT_DOMAINS = ["topsfield-ma.gov",
-                         "middletonma.gov",
-                         "danversma.gov",
-                         "essexma.org",
-                         "hamiltonma.gov",
-                         "wenhamma.gov"
-                        ]; // add more any time
+const DEFAULT_DOMAINS = [
+  "arcticwolf.com",
+  "cai-tech.com",
+  "catalisgov.com",
+  "citrix.com",
+  "civicplus.com",
+  "esri.com",
+  "focustsi.com",
+  "freshworks.com",
+  "genetec.com",
+  "intrasystems.com",
+  "jamf.com",
+  "keepit.com",
+  "emiia.org",
+  "microsoft.com",
+  "mimecast.com",
+  "n-able.com",
+  "ninjaone.com",
+  "ockers.com",
+  "opengov.com",
+  "schneidergis.com",
+  "securewon.com",
+  "sentinelone.com",
+  "springbrooksoftware.com",
+  "tylertech.com",
+  "unibank.com",
+  "vadarsystems.com",
+  "verkada.com",
+  "vertexone.net",
+  "wasabi.com",
+  "wilson-controls.com",
+  "employeeforward.com",
+  "onec1.com",
+  "permiteyes.com",
+  "workeasysoftware.com",
+]; // add more any time
 
 export default {
   async fetch(req, env, ctx) {
@@ -170,11 +199,46 @@ function renderPage() {
   </section>
 
   <footer>
-    Tip: Bookmark with a query string like <code>?vendors=danversma.gov,topsfield-ma.gov</code> to preload a custom list.
+    Tip: Bookmark with a query string like <code>?vendors=arcticwolf.com,cai-tech.com</code> to preload a custom list.
   </footer>
 
   <script>
-    var DEFAULTS = ["topsfield-ma.gov"]; // server keeps same default
+    var DEFAULTS = [
+      "arcticwolf.com",
+      "cai-tech.com",
+      "catalisgov.com",
+      "citrix.com",
+      "civicplus.com",
+      "esri.com",
+      "focustsi.com",
+      "freshworks.com",
+      "genetec.com",
+      "intrasystems.com",
+      "jamf.com",
+      "keepit.com",
+      "emiia.org",
+      "microsoft.com",
+      "mimecast.com",
+      "n-able.com",
+      "ninjaone.com",
+      "ockers.com",
+      "opengov.com",
+      "schneidergis.com",
+      "securewon.com",
+      "sentinelone.com",
+      "springbrooksoftware.com",
+      "tylertech.com",
+      "unibank.com",
+      "vadarsystems.com",
+      "verkada.com",
+      "vertexone.net",
+      "wasabi.com",
+      "wilson-controls.com",
+      "employeeforward.com",
+      "onec1.com",
+      "permiteyes.com",
+      "workeasysoftware.com",
+    ]; // server keeps same default
     var grid = document.getElementById('grid');
     var input = document.getElementById('vendors');
     var sortSel = document.getElementById('sort');
