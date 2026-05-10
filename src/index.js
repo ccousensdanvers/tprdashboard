@@ -26,6 +26,10 @@ const REPORT_TYPES = {
 
 const SAMPLE_PORTFOLIO = createSamplePortfolio();
 
+function strictQueryString(params) {
+  return new URLSearchParams(params).toString().replace(/\+/g, "%20");
+}
+
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
@@ -105,9 +109,9 @@ async function fetchPortfolioRiskProfilePages(env, portfolioId) {
   const seenTokens = new Set();
 
   do {
-    const params = new URLSearchParams({ portfolios: portfolioId, page_size: String(PORTFOLIO_PAGE_SIZE) });
-    if (pageToken) params.set("page_token", pageToken);
-    const page = await fetchUpGuardJson(env, "/risks/vendors/all?" + params.toString());
+    const params = { portfolios: portfolioId, page_size: String(PORTFOLIO_PAGE_SIZE) };
+    if (pageToken) params.page_token = pageToken;
+    const page = await fetchUpGuardJson(env, "/risks/vendors/all?" + strictQueryString(params));
     pages.push(page);
     pageToken = String(page.next_page_token || page.nextPageToken || page.pagination?.next_page_token || "");
     if (pageToken && seenTokens.has(pageToken)) throw new Error("UpGuard risk-profile pagination returned a repeated next_page_token.");
@@ -137,8 +141,8 @@ async function loadPortfolioChanges(env, days) {
   }
 
   try {
-    const params = new URLSearchParams({ portfolios: getConfiguredPortfolioId(env), days: String(days) });
-    const data = await fetchUpGuardJson(env, "/risk/vendors/diff?" + params.toString());
+    const params = { portfolios: getConfiguredPortfolioId(env), days: String(days) };
+    const data = await fetchUpGuardJson(env, "/risk/vendors/diff?" + strictQueryString(params));
     const changes = extractItems(data, ["changes", "events", "results", "data", "diffs"]).map(normalizeChangeRecord).sort(sortNewestChangeFirst);
     // TODO(D1): persist diff events and derived snapshots for trend analysis and resolved-risk reporting.
     return { portfolioName: PORTFOLIO_NAME, portfolioId: getConfiguredPortfolioId(env), source: "upguard", warning: null, days, changes, generatedAt: new Date().toISOString() };
