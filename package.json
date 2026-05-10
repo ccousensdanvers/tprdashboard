@@ -2,7 +2,7 @@
   "name": "thirdpartyrisk-dashboard",
   "private": true,
   "version": "1.0.0",
-  "description": "Cloudflare Worker: UpGuard score dashboard",
+  "description": "Cloudflare Worker: UpGuard portfolio cyber risk intelligence dashboard",
   "scripts": {
     "dev": "wrangler dev",
     "deploy:staging": "wrangler deploy --env staging",
@@ -10,5 +10,6 @@
   },
   "devDependencies": {
     "wrangler": "^3.81.0"
-  }
+  },
+  "type": "module"
 }
