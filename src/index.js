@@ -238,7 +238,7 @@ async function runIngestion(env, { trigger = "manual", batchSize = DEFAULT_BATCH
 
 function getIngestionOptions(url, { defaultLimit = PORTFOLIO_VENDORS.length, defaultBatchSize = DEFAULT_BATCH_SIZE } = {}) {
   const hasQueryParameters = Array.from(url.searchParams.keys()).length > 0;
-  const hostname = normalizeHostname(url.searchParams.get("hostname"));
+  const hostname = normalizeHostname(url.searchParams.get("vendor_primary_hostname")) || normalizeHostname(url.searchParams.get("hostname"));
   const batchSize = url.searchParams.has("batchSize")
     ? clamp(url.searchParams.get("batchSize"), 1, MAX_BATCH_SIZE)
     : hasQueryParameters
@@ -440,12 +440,21 @@ async function fetchRiskDiff(env, hostname, { startDate, endDate }) {
   return parseUpGuardResponse(response, `risk diff for ${hostname}`);
 }
 
-function fetchRiskDiffResponse(env, hostname, startDate, endDate) {
+function buildRiskDiffUrl(hostname, startDate, endDate) {
+  const vendorPrimaryHostname = normalizeHostname(hostname);
+  if (!vendorPrimaryHostname) {
+    throw new Error("Missing vendor_primary_hostname for risk diff request.");
+  }
+
   const url = new URL(UPGUARD_RISK_DIFF_ENDPOINT);
-  url.searchParams.set("vendor_primary_hostname", hostname);
+  url.searchParams.set("vendor_primary_hostname", vendorPrimaryHostname);
   url.searchParams.set("start_date", startDate);
   url.searchParams.set("end_date", endDate);
-  return fetchUpGuard(env, url);
+  return url;
+}
+
+function fetchRiskDiffResponse(env, hostname, startDate, endDate) {
+  return fetchUpGuard(env, buildRiskDiffUrl(hostname, startDate, endDate));
 }
 
 async function parseUpGuardResponse(response, label) {
@@ -976,13 +985,32 @@ async function getDebugUpGuardVendorRisks(env, url) {
 
 async function getDebugUpGuardRiskDiff(env, url) {
   assertApiKey(env);
-  const hostname = normalizeHostname(url.searchParams.get("hostname") || "adobe.com");
+  const vendorPrimaryHostname =
+    normalizeHostname(url.searchParams.get("vendor_primary_hostname")) ||
+    normalizeHostname(url.searchParams.get("hostname")) ||
+    "adobe.com";
   const days = clamp(url.searchParams.get("days") || 30, 1, 30);
   const endDate = new Date();
   const startDate = new Date(endDate.getTime() - days * 24 * 60 * 60 * 1000);
-  const response = await fetchRiskDiffResponse(env, hostname, startDate.toISOString(), endDate.toISOString());
+  const startDateIso = startDate.toISOString();
+  const endDateIso = endDate.toISOString();
+  const upstreamUrl = buildRiskDiffUrl(vendorPrimaryHostname, startDateIso, endDateIso);
+  const response = await fetchUpGuard(env, upstreamUrl);
   const summary = await summarizeDebugResponse(response);
-  return { requestedHostname: hostname, days, startDate: startDate.toISOString(), endDate: endDate.toISOString(), ...summary };
+  return {
+    requestedHostname: vendorPrimaryHostname,
+    vendorPrimaryHostname,
+    days,
+    startDate: startDateIso,
+    endDate: endDateIso,
+    upstreamUrl: upstreamUrl.toString(),
+    upstreamParams: {
+      vendor_primary_hostname: vendorPrimaryHostname,
+      start_date: startDateIso,
+      end_date: endDateIso,
+    },
+    ...summary,
+  };
 }
 
 async function summarizeDebugResponse(response) {
