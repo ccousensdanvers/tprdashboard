@@ -2,6 +2,7 @@
 // Portfolio-first risk intelligence for the configured UpGuard Vendor Risk portfolio.
 
 const PORTFOLIO_NAME = "Commonwealth Common Vendors";
+const DEFAULT_PORTFOLIO_ID = PORTFOLIO_NAME;
 const PORTFOLIO_THRESHOLD = 700;
 const UPGUARD_BASE_URL = "https://cyber-risk.upguard.com/api/public";
 const PORTFOLIO_PAGE_SIZE = 2000;
@@ -73,7 +74,8 @@ export default {
 };
 
 function getConfiguredPortfolioId(env) {
-  return String((env || {}).UPGUARD_PORTFOLIO_ID || "").trim();
+  const configuredPortfolioId = String((env || {}).UPGUARD_PORTFOLIO_ID || "").trim();
+  return configuredPortfolioId || DEFAULT_PORTFOLIO_ID;
 }
 
 function hasUpGuardConfig(env) {
@@ -85,7 +87,7 @@ async function loadPortfolioRiskProfile(env) {
   const portfolioId = getConfiguredPortfolioId(env);
 
   if (!apiKey) return withSampleRiskProfileWarning(null, "missing_api_key", "UPGUARD_API_KEY is not configured; showing sample portfolio risk profile data.");
-  if (!portfolioId) return withSampleRiskProfileWarning(null, "missing_portfolio_id", "UPGUARD_PORTFOLIO_ID is not configured; showing sample portfolio risk profile data.");
+  if (!portfolioId) return withSampleRiskProfileWarning(null, "missing_portfolio_id", "No portfolio ID is configured; showing sample portfolio risk profile data.");
 
   try {
     const pages = await fetchPortfolioRiskProfilePages(env, portfolioId);
@@ -538,7 +540,7 @@ function withSampleRiskProfileWarning(portfolioId, code, message) {
 
 function missingConfigWarning(env) {
   if (!String((env || {}).UPGUARD_API_KEY || "").trim()) return { code: "missing_api_key", message: "UPGUARD_API_KEY is not configured; showing sample data." };
-  return { code: "missing_portfolio_id", message: "UPGUARD_PORTFOLIO_ID is not configured; showing sample data." };
+  return { code: "missing_portfolio_id", message: "No portfolio ID is configured; showing sample data." };
 }
 
 function normalizeSampleVendorSummaries() {
