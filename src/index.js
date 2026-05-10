@@ -5,7 +5,7 @@ const PORTFOLIO_NAME = "Commonwealth Common Vendors";
 const DEFAULT_PORTFOLIO_ID = PORTFOLIO_NAME;
 const PORTFOLIO_THRESHOLD = 700;
 const UPGUARD_BASE_URL = "https://cyber-risk.upguard.com/api/public";
-const PORTFOLIO_PAGE_SIZE = 2000;
+const PORTFOLIO_PAGE_SIZE = 100;
 
 /**
  * Stable frontend models emitted by the API routes:
