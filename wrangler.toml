@@ -6,9 +6,11 @@ compatibility_date = "2025-09-06"
 [observability.logs]
 enabled = true
 
-# Daily scheduled ingestion at 2 AM UTC.
-[triggers]
-crons = ["0 2 * * *"]
+# TODO: Enable scheduled ingestion only after manual ingestion is stable.
+# Scheduled ingestion is intentionally disabled so page load and background cron never
+# depend on UpGuard while manual, chunked ingestion is being stabilized.
+# [triggers]
+# crons = ["0 2 * * *"]
 
 [[d1_databases]]
 binding = "DB"

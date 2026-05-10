@@ -138,7 +138,10 @@ export default {
         return json(result, result.failureCount > 0 ? 207 : 200);
       }
 
-      if (request.method === "POST" && pathname === "/api/ingest/portfolio-risk-profile") return json(await ingestPortfolioRiskProfile(env));
+      if (request.method === "POST" && pathname === "/api/ingest/portfolio-risk-profile") {
+        const options = getIngestionOptions(url, { defaultLimit: 5, defaultBatchSize: 2 });
+        return json(await ingestPortfolioRiskProfile(env, { trigger: "api_portfolio_risk_profile", ...options }));
+      }
 
       if (request.method === "POST" && pathname === "/api/ingest/vendor-risks") {
         const options = getIngestionOptions(url, { defaultLimit: 5, defaultBatchSize: 2 });
@@ -177,8 +180,9 @@ export default {
     return json({ error: "not_found", message: "Route not found" }, 404);
   },
 
-  async scheduled(_event, env, ctx) {
-    ctx.waitUntil(runIngestion(env, { trigger: "scheduled" }));
+  async scheduled(_event, _env, ctx) {
+    // TODO: Enable scheduled ingestion only after manual ingestion is stable.
+    ctx.waitUntil(Promise.resolve({ skipped: true, reason: "scheduled_ingestion_disabled" }));
   },
 };
 
@@ -241,7 +245,7 @@ function getIngestionOptions(url, { defaultLimit = PORTFOLIO_VENDORS.length, def
       ? DEFAULT_BATCH_SIZE
       : clamp(defaultBatchSize, 1, MAX_BATCH_SIZE);
 
-  if (hostname) return { vendors: [hostname], batchSize };
+  if (hostname) return { vendors: [hostname], batchSize, offset: 0 };
 
   const offset = url.searchParams.has("offset") ? clamp(url.searchParams.get("offset"), 0, PORTFOLIO_VENDORS.length) : 0;
   const availableVendors = PORTFOLIO_VENDORS.slice(offset);
@@ -251,7 +255,7 @@ function getIngestionOptions(url, { defaultLimit = PORTFOLIO_VENDORS.length, def
       ? availableVendors.length
       : clamp(defaultLimit, 0, availableVendors.length);
 
-  return { vendors: availableVendors.slice(0, limit), batchSize };
+  return { vendors: availableVendors.slice(0, limit), batchSize, offset };
 }
 
 function normalizeVendorList(vendors) {
@@ -262,10 +266,37 @@ function normalizeHostname(hostname) {
   return String(hostname || "").trim().toLowerCase();
 }
 
-async function ingestPortfolioRiskProfile(env) {
+async function ingestPortfolioRiskProfile(env, { trigger = "manual", vendors = PORTFOLIO_VENDORS, batchSize = DEFAULT_BATCH_SIZE, offset = 0 } = {}) {
   assertDb(env);
   assertApiKey(env);
   await assertD1Schema(env, ["portfolio_risk_profile_snapshots", "portfolio_common_risks"]);
+  const selectedVendors = normalizeVendorList(vendors);
+  const boundedBatchSize = clamp(batchSize, 1, MAX_BATCH_SIZE);
+  const startedAt = new Date().toISOString();
+  if (!selectedVendors.length || offset > 0) {
+    return {
+      portfolioName: PORTFOLIO_NAME,
+      portfolioId: getPortfolioId(env),
+      trigger,
+      selectedVendorCount: 0,
+      vendorsProcessed: 0,
+      batchSize: boundedBatchSize,
+      snapshotId: null,
+      totalVendors: null,
+      riskCount: 0,
+      severityCounts: {},
+      topRisks: [],
+      successCount: 0,
+      failureCount: 0,
+      failures: [],
+      startedAt,
+      hasMore: false,
+      completedAt: new Date().toISOString(),
+    };
+  }
+  // UpGuard's portfolio risk profile endpoint is portfolio-scoped, so the server performs
+  // the profile refresh once for the requested chunk while the browser still drives all
+  // manual ingestion through limit=5, batchSize=2, offset-based calls.
   const pages = await fetchPortfolioRiskProfilePages(env);
   const allRisks = pages.flatMap(extractRiskRecords);
   const totalVendors = getFirstNumber(pages, ["total_vendors", "totalVendors", "vendor_count", "vendorCount", "total_count", "totalCount"]);
@@ -284,7 +315,25 @@ async function ingestPortfolioRiskProfile(env) {
     .slice()
     .sort((a, b) => (b.affectedVendorCount || 0) - (a.affectedVendorCount || 0) || (b.severity || 0) - (a.severity || 0))
     .slice(0, 10);
-  return { portfolioName: PORTFOLIO_NAME, portfolioId: getPortfolioId(env), snapshotId, totalVendors, riskCount: normalized.length, severityCounts, topRisks };
+  return {
+    portfolioName: PORTFOLIO_NAME,
+    portfolioId: getPortfolioId(env),
+    trigger,
+    selectedVendorCount: selectedVendors.length,
+    vendorsProcessed: selectedVendors.length,
+    batchSize: boundedBatchSize,
+    snapshotId,
+    totalVendors,
+    riskCount: normalized.length,
+    severityCounts,
+    topRisks,
+    successCount: 1,
+    failureCount: 0,
+    failures: [],
+    hasMore: false,
+    startedAt,
+    completedAt: new Date().toISOString(),
+  };
 }
 
 async function fetchPortfolioRiskProfilePages(env) {
@@ -456,8 +505,22 @@ async function getDebugUpGuardDomain(env, url) {
 
 async function getIngestionStatus(env) {
   assertDb(env);
-  await assertD1Schema(env, ["ingestion_runs", "ingestion_errors"]);
+  await assertD1Schema(env, [
+    "vendor_domains",
+    "vendor_active_risks",
+    "portfolio_risk_profile_snapshots",
+    "vendor_risk_events",
+    "ingestion_runs",
+    "ingestion_errors",
+  ]);
 
+  const counts = await env.DB.prepare(
+    `SELECT
+       (SELECT COUNT(*) FROM vendor_domains) AS domainRows,
+       (SELECT COUNT(*) FROM vendor_active_risks) AS activeRiskRows,
+       (SELECT COUNT(*) FROM portfolio_risk_profile_snapshots) AS portfolioRiskRows,
+       (SELECT COUNT(*) FROM vendor_risk_events) AS riskEventRows`
+  ).first();
   const latestRun = await env.DB.prepare(
     `SELECT id, started_at, completed_at, vendor_count, success_count, failure_count, status, error_json
      FROM ingestion_runs
@@ -477,10 +540,23 @@ async function getIngestionStatus(env) {
      LIMIT 10`
   ).all();
 
+  const domainRows = counts?.domainRows || 0;
+  const activeRiskRows = counts?.activeRiskRows || 0;
+  const portfolioRiskRows = counts?.portfolioRiskRows || 0;
+  const riskEventRows = counts?.riskEventRows || 0;
+  const lastIngestionRun = latestRun ? { ...latestRun, errors: parseJson(latestRun.error_json, []) } : null;
+
   return {
     portfolioName: PORTFOLIO_NAME,
     vendorCount: PORTFOLIO_VENDORS.length,
-    latestRun: latestRun ? { ...latestRun, errors: parseJson(latestRun.error_json, []) } : null,
+    domainRows,
+    activeRiskRows,
+    portfolioRiskRows,
+    riskEventRows,
+    lastIngestionRun,
+    lastErrors: recentErrors.results || [],
+    hasCachedData: Boolean(domainRows || activeRiskRows || portfolioRiskRows || riskEventRows),
+    latestRun: lastIngestionRun,
     recentRuns: recentRuns.results || [],
     recentErrors: recentErrors.results || [],
     generatedAt: new Date().toISOString(),
@@ -1349,7 +1425,7 @@ function renderDashboardShell() {
   </header>
   <main>
     <section id="status" class="card muted">Loading dashboard data…</section>
-    <section class="card"><h2>Ingestion Controls</h2><div class="actions"><button data-ingest="domains">Ingest Domains</button><button data-ingest="portfolio">Ingest Portfolio Risk Profile</button><button data-ingest="vendorRisks">Ingest Vendor Active Risks</button><button data-ingest="riskDiff">Ingest 30-Day Risk Diff</button></div><pre id="ingest-log" class="muted">Idle. Chunked vendor jobs use limit=5, batchSize=2, and offset pagination.</pre></section>
+    <section class="card"><h2>Ingestion Controls</h2><div class="actions"><button data-ingest="domains">Ingest Domain Details</button><button data-ingest="portfolio">Ingest Portfolio Risk Profile</button><button data-ingest="vendorRisks">Ingest Vendor Active Risks</button><button data-ingest="riskDiff">Ingest 30-Day Risk Diff</button></div><pre id="ingest-log" class="muted">Idle. Manual ingestion jobs use limit=5, batchSize=2, and offset pagination.</pre></section>
     <section id="overview" class="view"></section>
     <section id="vendors" class="view hidden"></section>
     <section id="common-risks" class="view hidden"></section>
@@ -1359,13 +1435,27 @@ function renderDashboardShell() {
     <section id="vendor-detail" class="view hidden"></section>
   </main>
 <script>
-const EMPTY_MESSAGE = 'No domain data has been ingested yet. Run ingestion to populate D1.';
-const state = { overview: null, vendors: [], risks: [], severities: [], categories: [], changes: [], campaigns: [], errors: {} };
+const EMPTY_MESSAGE = 'No cached risk data found. Run manual ingestion to populate the dashboard.';
+const state = { overview: null, vendors: [], risks: [], severities: [], categories: [], changes: [], campaigns: [], ingestStatus: null, errors: {} };
 const $ = id => document.getElementById(id);
 function esc(value) { return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function jsString(value) { return JSON.stringify(String(value || '')); }
 function badge(value) { const v = String(value || 'unknown'); return '<span class="badge ' + esc(v.toLowerCase()) + '">' + esc(v) + '</span>'; }
-async function api(path, options) { const r = await fetch(path, options); const data = await r.json().catch(() => ({})); if (!r.ok && r.status !== 207) throw new Error(data.message || data.error || 'HTTP ' + r.status); return data; }
+async function api(path, options = {}, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const r = await fetch(path, { ...options, signal: controller.signal });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok && r.status !== 207) throw new Error(data.message || data.error || 'HTTP ' + r.status);
+    return data;
+  } catch (error) {
+    if (error && error.name === 'AbortError') throw new Error('Timed out after ' + timeoutMs + 'ms');
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 async function load() {
   state.errors = {};
   const endpoints = [
@@ -1375,13 +1465,20 @@ async function load() {
     ['changes', '/api/dashboard/changes', d => state.changes = d.events || []],
     ['campaigns', '/api/dashboard/remediation-campaigns', d => state.campaigns = d.campaigns || []],
     ['severities', '/api/dashboard/severity-breakdown', d => state.severities = d.severities || []],
-    ['categories', '/api/dashboard/categories', d => state.categories = d.categories || []]
+    ['categories', '/api/dashboard/categories', d => state.categories = d.categories || []],
+    ['ingestStatus', '/api/ingest/status', d => state.ingestStatus = d]
   ];
-  let successCount = 0;
-  await Promise.all(endpoints.map(async ([key, path, assign]) => { try { assign(await api(path)); successCount += 1; } catch (e) { state.errors[key] = { label: key, message: e.message }; } }));
+  const results = await Promise.allSettled(endpoints.map(([key, path, assign]) => api(path).then(assign).then(() => key)));
+  const successCount = results.filter(result => result.status === 'fulfilled').length;
+  results.forEach((result, index) => {
+    if (result.status === 'rejected') {
+      const key = endpoints[index][0];
+      state.errors[key] = { label: key, message: result.reason && result.reason.message ? result.reason.message : String(result.reason) };
+    }
+  });
   const failureCount = endpoints.length - successCount;
-  const emptySuffix = !failureCount && !state.vendors.length ? ' ' + EMPTY_MESSAGE : '';
-  $('status').innerHTML = successCount + ' of ' + endpoints.length + ' dashboard endpoints loaded. ' + (failureCount ? 'Review the error cards below; loaded sections remain available.' : emptySuffix);
+  const hasCachedData = state.ingestStatus ? state.ingestStatus.hasCachedData : Boolean((state.vendors || []).length || (state.risks || []).length || (state.changes || []).length);
+  $('status').innerHTML = successCount + ' of ' + endpoints.length + ' D1 dashboard endpoints loaded. ' + (failureCount ? 'Review the error cards below; loaded sections remain available.' : (hasCachedData ? 'Ready.' : EMPTY_MESSAGE));
   renderOverview(); renderVendors(); renderRisks(); renderChanges(); renderCampaigns(); renderSeverity();
 }
 function renderOverview() {
@@ -1421,9 +1518,41 @@ function list(rows, key) { return rows && rows.length ? '<table><tbody>' + rows.
 function emptyCard() { return '<div class="card empty"><h2>No ingested data yet</h2><p>' + EMPTY_MESSAGE + '</p></div>'; }
 function errorCard(key) { const error = state.errors[key]; return error ? '<div class="card error-card"><h2>' + esc(error.label) + ' failed to load</h2><p>' + esc(error.message) + '</p></div>' : ''; }
 function show(view) { document.querySelectorAll('.view').forEach(el => el.classList.add('hidden')); $(view).classList.remove('hidden'); document.querySelectorAll('[data-view]').forEach(btn => btn.classList.toggle('active', btn.dataset.view === view)); }
-async function runChunked(path, label) { const log = $('ingest-log'); let offset = 0; let totalSuccess = 0; let totalFailures = 0; for (;;) { const sep = path.includes('?') ? '&' : '?'; const url = path + sep + 'limit=5&batchSize=2&offset=' + offset; log.textContent = label + ': running chunk offset ' + offset + '…\n' + log.textContent; const result = await api(url, { method: 'POST' }); totalSuccess += result.successCount || 0; totalFailures += result.failureCount || 0; log.textContent = label + ': finished offset ' + offset + ', successes=' + totalSuccess + ', failures=' + totalFailures + '\n' + JSON.stringify(result, null, 2); if ((result.selectedVendorCount || 0) < 5) break; offset += 5; } await load(); }
+async function runChunked(path, label) {
+  const log = $('ingest-log');
+  let offset = 0;
+  let totalSuccess = 0;
+  let totalFailures = 0;
+  for (;;) {
+    const sep = path.includes('?') ? '&' : '?';
+    const url = path + sep + 'limit=5&batchSize=2&offset=' + offset;
+    log.textContent = label + ': running chunk offset ' + offset + ' (limit=5, batchSize=2)…\n' + log.textContent;
+    const result = await api(url, { method: 'POST' }, 120000);
+    totalSuccess += result.successCount || 0;
+    totalFailures += result.failureCount || 0;
+    log.textContent = label + ': finished chunk offset ' + offset + ', processed=' + (result.vendorsProcessed ?? result.selectedVendorCount ?? 0) + ', successes=' + totalSuccess + ', failures=' + totalFailures + '\n' + JSON.stringify(result, null, 2);
+    if (result.hasMore === false || (result.selectedVendorCount || 0) < 5) break;
+    offset += 5;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  log.textContent = label + ': complete. Refreshing dashboard from D1…\n' + log.textContent;
+  await load();
+}
 document.querySelectorAll('[data-view]').forEach(btn => btn.addEventListener('click', () => show(btn.dataset.view)));
-document.querySelectorAll('[data-ingest]').forEach(btn => btn.addEventListener('click', async () => { try { const job = btn.dataset.ingest; if (job === 'domains') await runChunked('/api/ingest/chunk', 'Domain ingestion'); if (job === 'portfolio') { $('ingest-log').textContent = 'Portfolio risk profile ingestion running…'; $('ingest-log').textContent = JSON.stringify(await api('/api/ingest/portfolio-risk-profile', { method: 'POST' }), null, 2); await load(); } if (job === 'vendorRisks') await runChunked('/api/ingest/vendor-risks', 'Vendor active risks'); if (job === 'riskDiff') await runChunked('/api/ingest/risk-diff?days=30', '30-day risk diff'); } catch (e) { $('ingest-log').textContent = 'Ingestion failed: ' + e.message; } }));
+document.querySelectorAll('[data-ingest]').forEach(btn => btn.addEventListener('click', async () => {
+  btn.disabled = true;
+  try {
+    const job = btn.dataset.ingest;
+    if (job === 'domains') await runChunked('/api/ingest/chunk', 'Domain details ingestion');
+    if (job === 'portfolio') await runChunked('/api/ingest/portfolio-risk-profile', 'Portfolio risk profile ingestion');
+    if (job === 'vendorRisks') await runChunked('/api/ingest/vendor-risks', 'Vendor active risks ingestion');
+    if (job === 'riskDiff') await runChunked('/api/ingest/risk-diff?days=30', '30-day risk diff ingestion');
+  } catch (e) {
+    $('ingest-log').textContent = 'Ingestion failed: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}));
 show('overview'); load();
 </script>
 </body>
