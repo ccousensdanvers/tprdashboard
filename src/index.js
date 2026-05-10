@@ -58,9 +58,15 @@ export default {
       });
     }
 
+    if (path === "/api/portfolio/risk-profile" && method === "GET") {
+      const riskProfile = await loadPortfolioRiskProfile(env);
+      return json(riskProfile);
+    }
+
     if (path === "/api/portfolio/overview" && method === "GET") {
+      const riskProfile = await loadPortfolioRiskProfile(env);
       const portfolio = await loadPortfolioIntelligence(env);
-      return json(normalizePortfolioOverview(portfolio));
+      return json(normalizePortfolioOverview(portfolio, riskProfile));
     }
 
     if (path === "/api/portfolio/vendors" && method === "GET") {
@@ -69,8 +75,14 @@ export default {
     }
 
     if (path === "/api/portfolio/risks" && method === "GET") {
-      const portfolio = await loadPortfolioIntelligence(env);
-      return json({ portfolioName: PORTFOLIO_NAME, source: portfolio.source, warning: portfolio.warning, risks: normalizePortfolioRisks(portfolio) });
+      const riskProfile = await loadPortfolioRiskProfile(env);
+      return json({
+        portfolioName: riskProfile.portfolioName,
+        portfolioId: riskProfile.portfolioId,
+        source: riskProfile.source,
+        warning: riskProfile.warning,
+        risks: riskProfile.risks,
+      });
     }
 
     if (path === "/api/portfolio/changes" && method === "GET") {
@@ -80,8 +92,8 @@ export default {
     }
 
     if (path === "/api/portfolio/campaigns" && method === "GET") {
-      const portfolio = await loadPortfolioIntelligence(env);
-      return json({ portfolioName: PORTFOLIO_NAME, source: portfolio.source, warning: portfolio.warning, campaigns: normalizeRemediationCampaigns(portfolio) });
+      const riskProfile = await loadPortfolioRiskProfile(env);
+      return json({ portfolioName: PORTFOLIO_NAME, source: riskProfile.source, warning: riskProfile.warning, campaigns: normalizeRemediationCampaigns({ risks: riskProfile.risks, vendors: [] }) });
     }
 
     if (path === "/api/reports/request" && method === "POST") {
@@ -107,6 +119,142 @@ export default {
   },
 };
 
+function getConfiguredPortfolioId(env) {
+  const PORTFOLIO_ID = ((env || {}).UPGUARD_COMMONWEALTH_COMMON_VENDORS_PORTFOLIO_ID || "").trim();
+  return PORTFOLIO_ID;
+}
+
+async function loadPortfolioRiskProfile(env) {
+  const apiKey = (env.UPGUARD_API_KEY || "").trim();
+  const portfolioId = getConfiguredPortfolioId(env);
+
+  if (!apiKey) {
+    return withSampleRiskProfileWarning(null, "missing_api_key", "UPGUARD_API_KEY is not configured; showing sample risk profile data scoped to " + PORTFOLIO_NAME + ".");
+  }
+  if (!portfolioId) {
+    return withSampleRiskProfileWarning(null, "missing_portfolio_id", "UPGUARD_COMMONWEALTH_COMMON_VENDORS_PORTFOLIO_ID is not configured; showing sample risk profile data scoped to " + PORTFOLIO_NAME + ".");
+  }
+
+  try {
+    const pages = await fetchUpGuardPortfolioRiskProfilePages(apiKey, portfolioId);
+    return normalizePortfolioRiskProfilePages(pages, portfolioId, "upguard", null);
+  } catch (e) {
+    return withSampleRiskProfileWarning(portfolioId, "upguard_risk_profile_unavailable", (e && e.message ? e.message : String(e)) + "; showing sample risk profile data.");
+  }
+}
+
+async function fetchUpGuardPortfolioRiskProfilePages(apiKey, portfolioId) {
+  const pages = [];
+  let pageToken = "";
+  const seenTokens = new Set();
+
+  do {
+    const params = new URLSearchParams({ portfolios: portfolioId, page_size: "2000" });
+    if (pageToken) params.set("page_token", pageToken);
+    const data = await fetchUpGuardJson(apiKey, "/risks/vendors/all?" + params.toString());
+    pages.push(data);
+    pageToken = String(data.next_page_token || data.nextPageToken || data.next || "");
+    if (pageToken && seenTokens.has(pageToken)) throw new Error("UpGuard risk-profile pagination returned a repeated next_page_token.");
+    if (pageToken) seenTokens.add(pageToken);
+  } while (pageToken);
+
+  return pages;
+}
+
+function normalizePortfolioRiskProfilePages(pages, portfolioId, source, warning) {
+  const allRisks = [];
+  let totalVendors = null;
+
+  for (const page of pages) {
+    const pageTotal = numberOrNull(page.total_vendors ?? page.totalVendors ?? page.total_vendor_count ?? page.total_vendor_count_matching_filter ?? page.total ?? page.count);
+    if (pageTotal !== null) totalVendors = Math.max(totalVendors || 0, pageTotal);
+    allRisks.push(...extractRiskProfileRisks(page));
+  }
+
+  const risks = mergePortfolioRiskProfileRisks(allRisks);
+  const severityCounts = countBy(risks, "severity", true);
+  const categoryCounts = countBy(risks, "category", true);
+  const topRisks = risks.slice(0, 10);
+
+  return {
+    portfolioName: PORTFOLIO_NAME,
+    portfolioId,
+    source,
+    warning,
+    totalVendors: totalVendors ?? SAMPLE_PORTFOLIO.vendors.length,
+    risks,
+    severityCounts,
+    categoryCounts,
+    topRisks,
+    generatedAt: new Date().toISOString(),
+  };
+}
+
+function extractRiskProfileRisks(page) {
+  const direct = asArray(page.risks || page.findings || page.results || page.data, ["risks", "findings", "results", "data"]);
+  if (direct.length) return direct;
+
+  const nested = [];
+  for (const value of Object.values(page || {})) {
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      nested.push(...asArray(value.risks || value.findings || value.results || value.data, ["risks", "findings", "results", "data"]));
+    }
+  }
+  return nested;
+}
+
+function mergePortfolioRiskProfileRisks(rawRisks) {
+  const grouped = new Map();
+
+  for (const rawRisk of rawRisks) {
+    const risk = normalizeRiskProfileRecord(rawRisk);
+    const key = [risk.name, risk.severity, risk.category, risk.type, risk.subtype].map((value) => String(value || "").toLowerCase()).join("|");
+    if (!grouped.has(key)) {
+      grouped.set(key, { ...risk, vendorsImpacted: 0, affectedHostnames: new Set(risk.affectedHostnames || []) });
+    }
+    const item = grouped.get(key);
+    item.vendorsImpacted += Math.max(risk.vendorsImpacted, 0);
+    for (const hostname of risk.affectedHostnames || []) item.affectedHostnames.add(hostname);
+    if (risk.firstDetected && (!item.firstDetected || new Date(risk.firstDetected) < new Date(item.firstDetected))) item.firstDetected = risk.firstDetected;
+    if (!item.recommendation && risk.recommendation) item.recommendation = risk.recommendation;
+  }
+
+  return Array.from(grouped.values()).map((risk) => ({
+    ...risk,
+    vendorsImpacted: risk.vendorsImpacted || 1,
+    affectedHostnames: Array.from(risk.affectedHostnames).slice(0, 12),
+  })).sort(compareRiskPriority);
+}
+
+function normalizeRiskProfileRecord(risk) {
+  const normalized = normalizeRiskRecord(risk);
+  return {
+    id: normalized.id,
+    name: normalized.name,
+    severity: normalized.severity,
+    category: normalized.category,
+    type: normalized.type || "—",
+    subtype: normalized.subtype || "—",
+    vendorsImpacted: numberOrZero(risk.vendors_affected ?? risk.affected_vendors ?? risk.affected_vendor_count ?? risk.vendor_count ?? risk.vendorsImpacted ?? normalized.vendorsImpacted),
+    affectedHostnames: asArray(risk.hostnames || risk.hosts || risk.domains || risk.assets || risk.affectedHostnames, []),
+    firstDetected: normalized.firstDetected,
+    recommendation: normalized.recommendation,
+    status: normalized.status,
+  };
+}
+
+function countBy(items, field, weightByVendors) {
+  return items.reduce((counts, item) => {
+    const key = item[field] || "Uncategorized";
+    counts[key] = (counts[key] || 0) + (weightByVendors ? Math.max(numberOrZero(item.vendorsImpacted), 1) : 1);
+    return counts;
+  }, {});
+}
+
+function withSampleRiskProfileWarning(portfolioId, code, message) {
+  return normalizePortfolioRiskProfilePages([{ total_vendors: SAMPLE_PORTFOLIO.vendors.length, risks: normalizePortfolioRisks(SAMPLE_PORTFOLIO) }], portfolioId, "sample", { code, message });
+}
+
 async function loadPortfolioIntelligence(env) {
   const apiKey = (env.UPGUARD_API_KEY || "").trim();
   if (!apiKey) {
@@ -114,19 +262,18 @@ async function loadPortfolioIntelligence(env) {
   }
 
   try {
-    const portfolio = await findUpGuardPortfolio(apiKey, PORTFOLIO_NAME);
-    if (!portfolio) {
-      return withSampleWarning("portfolio_missing", "The UpGuard portfolio named " + PORTFOLIO_NAME + " was not found or is inaccessible.");
+    const portfolioId = getConfiguredPortfolioId(env);
+    if (!portfolioId) {
+      return withSampleWarning("missing_portfolio_id", "UPGUARD_COMMONWEALTH_COMMON_VENDORS_PORTFOLIO_ID is not configured; showing sample data scoped to " + PORTFOLIO_NAME + ".");
     }
 
-    const portfolioId = portfolio.id || portfolio.uuid || portfolio.slug || portfolio.name || PORTFOLIO_NAME;
     const [vendorsRaw, risksRaw, changesRaw] = await Promise.all([
       fetchUpGuardJson(apiKey, "/portfolios/" + encodeURIComponent(portfolioId) + "/vendors"),
       fetchUpGuardJson(apiKey, "/portfolios/" + encodeURIComponent(portfolioId) + "/risks"),
       fetchUpGuardJson(apiKey, "/portfolios/" + encodeURIComponent(portfolioId) + "/changes?days=30"),
     ]);
 
-    return normalizeUpGuardPortfolioPayload(portfolio, vendorsRaw, risksRaw, changesRaw);
+    return normalizeUpGuardPortfolioPayload({ id: portfolioId, name: PORTFOLIO_NAME }, vendorsRaw, risksRaw, changesRaw);
   } catch (e) {
     return withSampleWarning("upguard_unavailable", (e && e.message ? e.message : String(e)) + "; showing sample portfolio intelligence.");
   }
@@ -236,25 +383,31 @@ function normalizeChangeRecord(change) {
   };
 }
 
-function normalizePortfolioOverview(portfolio) {
+function normalizePortfolioOverview(portfolio, riskProfile) {
   const vendors = normalizeVendorSummaries(portfolio);
-  const risks = normalizePortfolioRisks(portfolio);
+  const risks = riskProfile && Array.isArray(riskProfile.risks) ? riskProfile.risks : normalizePortfolioRisks(portfolio);
   const changes = normalizeRiskChanges(portfolio, 30);
-  const campaigns = normalizeRemediationCampaigns(portfolio);
-  const averageScore = vendors.length ? Math.round(vendors.reduce((sum, vendor) => sum + (vendor.score || 0), 0) / vendors.length) : null;
-  const criticalRiskCount = risks.filter((risk) => risk.severity === "critical").reduce((sum, risk) => sum + risk.vendorsImpacted, 0);
-  const highRiskCount = risks.filter((risk) => risk.severity === "high").reduce((sum, risk) => sum + risk.vendorsImpacted, 0);
-  const topFinding = risks[0] || null;
+  const campaigns = normalizeRemediationCampaigns({ risks, vendors: [] });
+  const scoreValues = vendors.map((vendor) => vendor.score).filter((score) => typeof score === "number");
+  const averageScore = scoreValues.length ? Math.round(scoreValues.reduce((sum, score) => sum + score, 0) / scoreValues.length) : null;
+  const criticalRiskCount = risks.filter((risk) => risk.severity === "critical").reduce((sum, risk) => sum + Math.max(numberOrZero(risk.vendorsImpacted), 1), 0);
+  const highRiskCount = risks.filter((risk) => risk.severity === "high").reduce((sum, risk) => sum + Math.max(numberOrZero(risk.vendorsImpacted), 1), 0);
+  const topFinding = (riskProfile && riskProfile.topRisks && riskProfile.topRisks[0]) || risks[0] || null;
   const topCampaign = campaigns[0] || null;
   const newlyIntroduced30d = changes.filter((change) => change.changeType === "new risk" || change.changeType === "worsened").length;
   const remediated30d = changes.filter((change) => change.changeType === "resolved risk" || change.changeType === "improved").length;
+  const vendorCount = riskProfile && typeof riskProfile.totalVendors === "number" ? riskProfile.totalVendors : vendors.length;
 
   return {
     portfolioName: PORTFOLIO_NAME,
-    source: portfolio.source,
-    warning: portfolio.warning,
+    portfolioId: riskProfile ? riskProfile.portfolioId : portfolio.portfolioId,
+    source: riskProfile ? riskProfile.source : portfolio.source,
+    warning: (riskProfile && riskProfile.warning) || portfolio.warning,
     averageScore,
-    vendorCount: vendors.length,
+    vendorCount,
+    totalVendors: vendorCount,
+    severityCounts: riskProfile ? riskProfile.severityCounts : countBy(risks, "severity", true),
+    categoryCounts: riskProfile ? riskProfile.categoryCounts : countBy(risks, "category", true),
     criticalRiskCount,
     highRiskCount,
     vendorsBelowThreshold: vendors.filter((vendor) => typeof vendor.score === "number" && vendor.score < PORTFOLIO_THRESHOLD).length,
@@ -263,7 +416,7 @@ function normalizePortfolioOverview(portfolio) {
     topFindingName: topFinding ? topFinding.name : "No common findings detected",
     topFindingAffectedVendorCount: topFinding ? topFinding.vendorsImpacted : 0,
     topCampaignRecommendation: topCampaign ? topCampaign.nextAction : "Continue monitoring portfolio changes and validate report coverage.",
-    executiveSummary: generateExecutiveSummary(vendors.length, averageScore, criticalRiskCount, highRiskCount, topFinding, topCampaign),
+    executiveSummary: generateExecutiveSummary(vendorCount, averageScore, criticalRiskCount, highRiskCount, topFinding, topCampaign),
   };
 }
 
@@ -310,6 +463,7 @@ function normalizePortfolioRisks(portfolio) {
         type: risk.type || "—",
         subtype: risk.subtype || "—",
         vendors: new Set(),
+        vendorImpactCount: 0,
         hostnames: new Set(),
         firstDetected: risk.firstDetected || null,
         recommendation: risk.recommendation || recommendationForRisk(risk.name, risk.category),
@@ -317,7 +471,8 @@ function normalizePortfolioRisks(portfolio) {
     }
     const item = grouped.get(key);
     if (risk.vendorName || risk.vendorDomain) item.vendors.add(risk.vendorName || risk.vendorDomain);
-    for (const host of risk.hostnames || []) item.hostnames.add(String(host));
+    item.vendorImpactCount = Math.max(item.vendorImpactCount, numberOrZero(risk.vendorsImpacted));
+    for (const host of [...(risk.hostnames || []), ...(risk.affectedHostnames || [])]) item.hostnames.add(String(host));
     if (risk.vendorDomain) item.hostnames.add(risk.vendorDomain);
     if (risk.firstDetected && (!item.firstDetected || new Date(risk.firstDetected) < new Date(item.firstDetected))) item.firstDetected = risk.firstDetected;
   }
@@ -329,7 +484,7 @@ function normalizePortfolioRisks(portfolio) {
     category: risk.category,
     type: risk.type,
     subtype: risk.subtype,
-    vendorsImpacted: Math.max(risk.vendors.size, 1),
+    vendorsImpacted: Math.max(risk.vendors.size, risk.vendorImpactCount, 1),
     affectedHostnames: Array.from(risk.hostnames).slice(0, 12),
     firstDetected: risk.firstDetected,
     recommendation: risk.recommendation,
@@ -406,10 +561,13 @@ async function handleReportRequest(req, env) {
   if (!reportType) return json({ error: "unknown_report_type", portfolioName: PORTFOLIO_NAME }, 400);
 
   const id = "rpt_" + safeFileName(type) + "_" + Date.now();
-  // TODO: Confirm exact UpGuard report request endpoint and payload. The portfolio parameter must remain PORTFOLIO_NAME.
+  const portfolioId = getConfiguredPortfolioId(env);
+  // TODO: Confirm exact UpGuard report request endpoint and payload. Portfolio report requests should pass vendor_portfolio_names and the configured portfolio identifier where the endpoint supports it.
   return json({
     id,
     portfolioName: PORTFOLIO_NAME,
+    portfolioId: portfolioId || null,
+    vendor_portfolio_names: [PORTFOLIO_NAME],
     status: "queued",
     reportType: type,
     label: reportType.label,
@@ -725,13 +883,13 @@ function renderPage() {
 
     function loadAll() {
       Promise.all([
+        api('/api/portfolio/risk-profile', { portfolioName: PORTFOLIO_NAME, totalVendors: 5, risks: sampleRisks(), severityCounts: {}, categoryCounts: {}, topRisks: sampleRisks(), source: 'client-sample', warning: { message: 'Client sample fallback.' } }),
         api('/api/portfolio/overview', sampleOverview()),
-        api('/api/portfolio/risks', { portfolioName: PORTFOLIO_NAME, risks: sampleRisks(), source: 'client-sample', warning: { message: 'Client sample fallback.' } }),
         api('/api/portfolio/vendors', { portfolioName: PORTFOLIO_NAME, vendors: sampleVendors(), source: 'client-sample' }),
         api('/api/portfolio/changes?days=30', { portfolioName: PORTFOLIO_NAME, changes: sampleChanges(), source: 'client-sample' }),
         api('/api/portfolio/campaigns', { portfolioName: PORTFOLIO_NAME, campaigns: sampleCampaigns(), source: 'client-sample' })
       ]).then(function(results){
-        state.overview = results[0]; state.risks = results[1].risks || []; state.vendors = results[2].vendors || []; state.changes = results[3].changes || []; state.campaigns = results[4].campaigns || [];
+        state.overview = results[1]; state.risks = results[0].risks || []; state.vendors = results[2].vendors || []; state.changes = results[3].changes || []; state.campaigns = results[4].campaigns || [];
         var warning = results.find(function(r){ return r && r.warning; });
         dataStatus.innerHTML = warning ? '<span class="warning">' + escapeHtml(warning.warning.message || 'Sample fallback active') + '</span>' : 'Live or normalized data loaded for <strong>' + PORTFOLIO_NAME + '</strong>';
         render();
