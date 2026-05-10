@@ -111,9 +111,12 @@ export default {
 
       if (request.method === "GET" && url.pathname === "/api/debug/db") return json(await getDebugDb(env));
       if (request.method === "GET" && url.pathname === "/api/debug/config") return json(getDebugConfig(env));
+      if (request.method === "GET" && url.pathname === "/api/debug/secret") return json(getDebugSecret(env));
+      if (request.method === "GET" && url.pathname === "/api/debug/upguard") return json(await getDebugUpGuard(env, url));
 
       if (request.method === "POST" && url.pathname === "/api/ingest") {
-        const result = await runIngestion(env, { trigger: "api" });
+        const options = getIngestionOptions(url);
+        const result = await runIngestion(env, { trigger: "api", ...options });
         return json(result, result.failureCount > 0 ? 207 : 200);
       }
 
@@ -139,22 +142,23 @@ export default {
   },
 };
 
-async function runIngestion(env, { trigger = "manual", batchSize = DEFAULT_BATCH_SIZE } = {}) {
+async function runIngestion(env, { trigger = "manual", batchSize = DEFAULT_BATCH_SIZE, vendors = PORTFOLIO_VENDORS } = {}) {
   assertDb(env);
   assertApiKey(env);
+  const selectedVendors = normalizeVendorList(vendors);
   const startedAt = new Date().toISOString();
   const startedMs = Date.now();
   const boundedBatchSize = clamp(batchSize, 1, MAX_BATCH_SIZE);
   const runInsert = await env.DB.prepare(
     `INSERT INTO ingestion_runs (started_at, vendor_count, success_count, failure_count, status, error_json)
      VALUES (?, ?, 0, 0, 'running', ?)`
-  ).bind(startedAt, PORTFOLIO_VENDORS.length, stringifyJson({ trigger })).run();
+  ).bind(startedAt, selectedVendors.length, stringifyJson({ trigger, batchSize: boundedBatchSize, vendors: selectedVendors })).run();
   const runId = runInsert.meta?.last_row_id;
 
   const successes = [];
   const failures = [];
 
-  for (const batch of chunk(PORTFOLIO_VENDORS, boundedBatchSize)) {
+  for (const batch of chunk(selectedVendors, boundedBatchSize)) {
     const results = await Promise.all(batch.map((hostname) => ingestVendor(env, hostname)));
     for (const result of results) {
       if (result.ok) successes.push(result.hostname);
@@ -174,7 +178,8 @@ async function runIngestion(env, { trigger = "manual", batchSize = DEFAULT_BATCH
     portfolioName: PORTFOLIO_NAME,
     runId,
     trigger,
-    vendorsProcessed: PORTFOLIO_VENDORS.length,
+    selectedVendorCount: selectedVendors.length,
+    vendorsProcessed: selectedVendors.length,
     successCount: successes.length,
     failureCount: failures.length,
     elapsedMs: Date.now() - startedMs,
@@ -183,6 +188,66 @@ async function runIngestion(env, { trigger = "manual", batchSize = DEFAULT_BATCH
     startedAt,
     completedAt,
   };
+}
+
+function getIngestionOptions(url) {
+  const hostname = normalizeHostname(url.searchParams.get("hostname"));
+  const batchSize = url.searchParams.has("batchSize")
+    ? clamp(url.searchParams.get("batchSize"), 1, MAX_BATCH_SIZE)
+    : DEFAULT_BATCH_SIZE;
+
+  if (hostname) return { vendors: [hostname], batchSize };
+
+  const offset = url.searchParams.has("offset") ? clamp(url.searchParams.get("offset"), 0, PORTFOLIO_VENDORS.length) : 0;
+  const availableVendors = PORTFOLIO_VENDORS.slice(offset);
+  const limit = url.searchParams.has("limit") ? clamp(url.searchParams.get("limit"), 0, availableVendors.length) : availableVendors.length;
+
+  return { vendors: availableVendors.slice(0, limit), batchSize };
+}
+
+function normalizeVendorList(vendors) {
+  return (Array.isArray(vendors) ? vendors : [])
+    .map(normalizeHostname)
+    .filter(Boolean);
+}
+
+function normalizeHostname(hostname) {
+  return String(hostname || "").trim().toLowerCase();
+}
+
+async function getDebugUpGuard(env, url) {
+  const hostname = normalizeHostname(url.searchParams.get("hostname") || "adobe.com");
+  const response = await fetch(`${UPGUARD_DOMAIN_ENDPOINT}?hostname=${encodeURIComponent(hostname)}`, {
+    headers: {
+      "Authorization": env.UPGUARD_API_KEY,
+      "Accept": "application/json",
+    },
+  });
+  const contentType = response.headers.get("content-type") || "";
+  const body = await response.text();
+
+  let data = null;
+  if (body && contentType.toLowerCase().includes("application/json")) {
+    data = parseJson(body, null);
+  }
+
+  const checkResults = Array.isArray(data?.check_results) ? data.check_results : [];
+  const waivedCheckResults = Array.isArray(data?.waived_check_results) ? data.waived_check_results : [];
+  const result = {
+    status: response.status,
+    ok: response.ok,
+    contentType,
+    topLevelKeys: data && typeof data === "object" && !Array.isArray(data) ? Object.keys(data) : [],
+    hostname: data?.hostname || hostname,
+    automated_score: data?.automated_score ?? null,
+    checkResultsCount: checkResults.length,
+    waivedCheckResultsCount: waivedCheckResults.length,
+    scanned_at: data?.scanned_at || null,
+    firstCheckSample: checkResults[0] || null,
+  };
+
+  if (!response.ok) result.errorBody = body.slice(0, 2000);
+  return result;
 }
 
 async function ingestVendor(env, hostname) {
@@ -503,6 +568,13 @@ function getDebugConfig(env) {
     portfolioName: PORTFOLIO_NAME,
     configuredVendorCount: PORTFOLIO_VENDORS.length,
     databaseBindingNameExpected: "DB",
+  };
+}
+
+function getDebugSecret(env) {
+  return {
+    hasUpGuardApiKey: Boolean(env.UPGUARD_API_KEY),
+    apiKeyLength: env.UPGUARD_API_KEY ? env.UPGUARD_API_KEY.length : 0,
   };
 }
 
