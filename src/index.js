@@ -251,7 +251,7 @@ function getIngestionOptions(url, { defaultLimit = PORTFOLIO_VENDORS.length, def
       ? DEFAULT_BATCH_SIZE
       : clamp(defaultBatchSize, 1, MAX_BATCH_SIZE);
 
-  if (hostname) return { vendors: [hostname], batchSize, offset: 0 };
+  if (hostname) return { vendors: [hostname], batchSize, offset: 0, manualVendor: true };
 
   const offset = url.searchParams.has("offset") ? clamp(url.searchParams.get("offset"), 0, PORTFOLIO_VENDORS.length) : 0;
   const availableVendors = PORTFOLIO_VENDORS.slice(offset);
@@ -364,7 +364,7 @@ function fetchPortfolioRiskProfileResponse(env, pageToken = "") {
   return fetchUpGuard(env, url);
 }
 
-async function runVendorRiskIngestion(env, { trigger = "manual", batchSize = DEFAULT_BATCH_SIZE, vendors = PORTFOLIO_VENDORS } = {}) {
+async function runVendorRiskIngestion(env, { trigger = "manual", batchSize = DEFAULT_BATCH_SIZE, vendors = PORTFOLIO_VENDORS, offset = 0, manualVendor = false } = {}) {
   assertDb(env);
   assertApiKey(env);
   await assertD1Schema(env, ["vendor_active_risks", "ingestion_errors"]);
@@ -374,36 +374,66 @@ async function runVendorRiskIngestion(env, { trigger = "manual", batchSize = DEF
   const successes = [];
   const failures = [];
   for (const batch of chunk(selectedVendors, boundedBatchSize)) {
-    const results = await Promise.all(batch.map((hostname) => ingestVendorActiveRisks(env, hostname)));
-    for (const result of results) result.ok ? successes.push(result.hostname) : failures.push(result);
+    const results = await Promise.all(batch.map((vendorPrimaryHostname) => ingestVendorActiveRisks(env, vendorPrimaryHostname)));
+    for (const result of results) result.ok ? successes.push(result.vendorPrimaryHostname) : failures.push(result);
   }
-  return { portfolioName: PORTFOLIO_NAME, trigger, selectedVendorCount: selectedVendors.length, vendorsProcessed: selectedVendors.length, successCount: successes.length, failureCount: failures.length, failures, startedAt, completedAt: new Date().toISOString() };
+  const nextOffset = offset + selectedVendors.length;
+  return {
+    portfolioName: PORTFOLIO_NAME,
+    trigger,
+    selectedVendorCount: selectedVendors.length,
+    vendorsProcessed: selectedVendors.length,
+    offset,
+    nextOffset,
+    hasMore: !manualVendor && nextOffset < PORTFOLIO_VENDORS.length && selectedVendors.length > 0,
+    successCount: successes.length,
+    failureCount: failures.length,
+    failures,
+    startedAt,
+    completedAt: new Date().toISOString(),
+  };
 }
 
-async function ingestVendorActiveRisks(env, hostname) {
+async function ingestVendorActiveRisks(env, vendorPrimaryHostname) {
+  const cleanVendorPrimaryHostname = normalizeHostname(vendorPrimaryHostname);
   try {
-    const data = await fetchVendorActiveRisks(env, hostname);
-    const risks = extractRiskRecords(data).map((risk) => normalizeVendorRisk(hostname, risk));
-    await env.DB.prepare("DELETE FROM vendor_active_risks WHERE vendor_primary_hostname = ?").bind(hostname).run();
+    const data = await fetchVendorActiveRisks(env, cleanVendorPrimaryHostname);
+    const risks = extractRiskRecords(data).map((risk) => normalizeVendorRisk(cleanVendorPrimaryHostname, risk));
+    await env.DB.prepare("DELETE FROM vendor_active_risks WHERE vendor_primary_hostname = ?").bind(cleanVendorPrimaryHostname).run();
     for (const batch of chunk(risks.map((risk) => insertVendorRiskStatement(env.DB, risk)), 50)) {
       if (batch.length) await env.DB.batch(batch);
     }
-    return { ok: true, hostname, riskCount: risks.length };
+    return { ok: true, hostname: cleanVendorPrimaryHostname, vendorPrimaryHostname: cleanVendorPrimaryHostname, riskCount: risks.length };
   } catch (error) {
-    const failure = { ok: false, hostname, errorMessage: getErrorMessage(error), statusCode: error.statusCode || null, responseBody: error.responseBody || null };
+    const failure = {
+      ok: false,
+      hostname: cleanVendorPrimaryHostname,
+      vendorPrimaryHostname: cleanVendorPrimaryHostname,
+      errorMessage: getErrorMessage(error),
+      statusCode: error.statusCode || null,
+      responseBody: error.responseBody || null,
+    };
     await logIngestionError(env.DB, failure);
     return failure;
   }
 }
 
-async function fetchVendorActiveRisks(env, hostname) {
-  const response = await fetchVendorActiveRisksResponse(env, hostname);
-  return parseUpGuardResponse(response, `vendor active risks for ${hostname}`);
+async function fetchVendorActiveRisks(env, vendorPrimaryHostname) {
+  const cleanVendorPrimaryHostname = normalizeHostname(vendorPrimaryHostname);
+  const response = await fetchVendorActiveRisksResponse(env, cleanVendorPrimaryHostname);
+  return parseUpGuardResponse(response, `vendor active risks for ${cleanVendorPrimaryHostname}`);
 }
 
-function fetchVendorActiveRisksResponse(env, hostname) {
+function fetchVendorActiveRisksResponse(env, vendorPrimaryHostname) {
+  const cleanVendorPrimaryHostname = normalizeHostname(vendorPrimaryHostname);
+
+  if (!cleanVendorPrimaryHostname) {
+    throw new Error("vendor_primary_hostname is required for UpGuard active risks.");
+  }
+
   const url = new URL(UPGUARD_VENDOR_RISKS_ENDPOINT);
-  url.searchParams.set("vendor_primary_hostname", hostname);
+  url.searchParams.set("vendor_primary_hostname", cleanVendorPrimaryHostname);
+
   return fetchUpGuard(env, url);
 }
 
@@ -1004,10 +1034,20 @@ async function getDebugUpGuardRiskProfile(env) {
 
 async function getDebugUpGuardVendorRisks(env, url) {
   assertApiKey(env);
-  const hostname = normalizeHostname(url.searchParams.get("hostname") || "adobe.com");
-  const response = await fetchVendorActiveRisksResponse(env, hostname);
-  const summary = await summarizeDebugResponse(response);
-  return { requestedHostname: hostname, ...summary };
+  const requestedVendorPrimaryHostname =
+    normalizeHostname(url.searchParams.get("vendor_primary_hostname")) ||
+    normalizeHostname(url.searchParams.get("hostname")) ||
+    "adobe.com";
+  const response = await fetchVendorActiveRisksResponse(env, requestedVendorPrimaryHostname);
+  const summary = await summarizeVendorRisksDebugResponse(response);
+  return {
+    requestedVendorPrimaryHostname,
+    upstreamEndpoint: UPGUARD_VENDOR_RISKS_ENDPOINT,
+    upstreamParams: {
+      vendor_primary_hostname: requestedVendorPrimaryHostname,
+    },
+    ...summary,
+  };
 }
 
 async function getDebugUpGuardRiskDiff(env, url) {
@@ -1074,6 +1114,24 @@ async function summarizeDebugResponse(response) {
   return result;
 }
 
+async function summarizeVendorRisksDebugResponse(response) {
+  const contentType = response.headers.get("content-type") || "";
+  const body = await response.text();
+  const data = body && contentType.toLowerCase().includes("application/json") ? parseJson(body, null) : null;
+  const records = extractRiskRecords(data);
+  const result = {
+    status: response.status,
+    ok: response.ok,
+    contentType,
+    topLevelKeys: data && typeof data === "object" && !Array.isArray(data) ? Object.keys(data) : [],
+    riskCount: records.length,
+    firstRiskSample: records[0] || null,
+    errorBody: null,
+  };
+  if (!response.ok) result.errorBody = body.slice(0, 2000);
+  return result;
+}
+
 function buildDebugCounts(data, records) {
   const counts = { records: records.length };
   if (data && typeof data === "object" && !Array.isArray(data)) {
@@ -1097,9 +1155,9 @@ function insertVendorRiskStatement(db, risk) {
   return db.prepare(
     `INSERT INTO vendor_active_risks (
       vendor_primary_hostname, risk_key, title, finding, category, risk_type, risk_subtype, severity,
-      severity_name, first_detected, affected_hostnames_json, waived, raw_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).bind(risk.vendorPrimaryHostname, risk.riskKey, risk.title, risk.finding, risk.category, risk.riskType, risk.riskSubtype, risk.severity, risk.severityName, risk.firstDetected, risk.affectedHostnamesJson, risk.waived, risk.rawJson);
+      severity_name, first_detected, affected_hostnames_json, waived, raw_json, captured_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(risk.vendorPrimaryHostname, risk.riskKey, risk.title, risk.finding, risk.category, risk.riskType, risk.riskSubtype, risk.severity, risk.severityName, risk.firstDetected, risk.affectedHostnamesJson, risk.waived, risk.rawJson, risk.capturedAt);
 }
 
 function insertRiskEventStatement(db, event) {
@@ -1120,15 +1178,31 @@ function normalizeCommonRisk(risk) {
   };
 }
 
-function normalizeVendorRisk(hostname, risk) {
-  const base = normalizeRiskFields(risk);
+function normalizeVendorRisk(vendorPrimaryHostname, risk) {
+  const safeRisk = risk && typeof risk === "object" ? risk : {};
   return {
-    ...base,
-    vendorPrimaryHostname: hostname,
-    riskKey: stringOrNull(firstDefined(risk.risk_key, risk.riskKey, risk.key, risk.id, risk.check_id, risk.checkId)),
-    firstDetected: stringOrNull(firstDefined(risk.first_detected, risk.firstDetected, risk.first_seen, risk.firstSeen, risk.created_at, risk.createdAt)),
-    affectedHostnamesJson: stringifyJson(extractAffectedHostnames(risk)),
-    waived: toBooleanInteger(firstDefined(risk.waived, risk.is_waived, risk.isWaived)) || 0,
+    vendorPrimaryHostname,
+    riskKey: stringOrNull(
+      firstDefined(
+        safeRisk.id,
+        safeRisk.key,
+        safeRisk.riskId,
+        safeRisk.risk_id,
+        `${vendorPrimaryHostname}:${safeRisk.title || safeRisk.finding || safeRisk.risk || "unknown"}`
+      )
+    ),
+    title: stringOrNull(firstDefined(safeRisk.title, safeRisk.finding, safeRisk.risk, safeRisk.name)),
+    finding: stringOrNull(firstDefined(safeRisk.finding, safeRisk.title, safeRisk.risk, safeRisk.name)),
+    category: stringOrNull(safeRisk.category),
+    riskType: stringOrNull(firstDefined(safeRisk.riskType, safeRisk.risk_type)),
+    riskSubtype: stringOrNull(firstDefined(safeRisk.riskSubtype, safeRisk.risk_subtype)),
+    severity: safeRisk.severity ?? null,
+    severityName: stringOrNull(firstDefined(safeRisk.severityName, safeRisk.severity_name)),
+    firstDetected: stringOrNull(firstDefined(safeRisk.firstDetected, safeRisk.first_detected)),
+    affectedHostnamesJson: JSON.stringify(safeRisk.hostnames || safeRisk.domains || safeRisk.sources || []),
+    waived: safeRisk.waived ? 1 : 0,
+    rawJson: JSON.stringify(safeRisk),
+    capturedAt: new Date().toISOString(),
   };
 }
 
@@ -1177,10 +1251,9 @@ function normalizeRiskFields(risk) {
 
 function extractRiskRecords(data) {
   if (Array.isArray(data)) return data;
-  if (!data || typeof data !== "object") return [];
-  for (const key of ["risks", "results", "records", "data", "items", "common_risks", "commonRisks", "vendor_risks", "vendorRisks"]) {
-    if (Array.isArray(data[key])) return data[key];
-  }
+  if (Array.isArray(data?.risks)) return data.risks;
+  if (Array.isArray(data?.results)) return data.results;
+  if (Array.isArray(data?.items)) return data.items;
   return [];
 }
 
@@ -1543,7 +1616,7 @@ function renderDashboardShell() {
   </header>
   <main>
     <section id="status" class="card muted">Loading dashboard data…</section>
-    <section class="card"><h2>Ingestion Controls</h2><div class="actions"><button data-ingest="domains">Ingest Domain Details</button><button data-ingest="portfolio">Ingest Portfolio Risk Profile</button><button data-ingest="vendorRisks">Ingest Vendor Active Risks</button><button data-ingest="riskDiff">Ingest 30-Day Risk Diff</button></div><pre id="ingest-log" class="muted">Idle. Manual ingestion jobs use limit=5, batchSize=2, and offset pagination.</pre></section>
+    <section class="card"><h2>Ingestion Controls</h2><div class="actions"><button data-ingest="domains">Ingest Domain Details</button><button data-ingest="portfolio">Ingest Portfolio Risk Profile</button><button data-ingest="vendorRisks">Ingest Active Risks</button><button data-ingest="riskDiff">Ingest 30-Day Risk Diff</button></div><pre id="ingest-log" class="muted">Idle. Manual ingestion jobs use limit=5, batchSize=2, and offset pagination.</pre></section>
     <section id="overview" class="view"></section>
     <section id="vendors" class="view hidden"></section>
     <section id="common-risks" class="view hidden"></section>
@@ -1694,21 +1767,43 @@ function emptyCard() { return '<div class="card empty"><h2>No ingested data yet<
 function errorCard(key) { const error = state.errors[key]; return error ? renderError(error.label + ' failed to load', error.message) : ''; }
 function bindVendorLinks() { document.querySelectorAll('[data-hostname]').forEach(btn => { btn.addEventListener('click', () => showVendor(btn.dataset.hostname)); }); }
 function show(view) { document.querySelectorAll('.view').forEach(el => el.classList.add('hidden')); $(view).classList.remove('hidden'); document.querySelectorAll('[data-view]').forEach(btn => btn.classList.toggle('active', btn.dataset.view === view)); }
-async function runChunked(path, label) {
+async function runChunked(path, label, options = {}) {
   const log = $('ingest-log');
+  const limit = options.limit || 5;
+  const batchSize = options.batchSize || 2;
+  const totalVendors = options.totalVendors || null;
   let offset = 0;
+  let processed = 0;
   let totalSuccess = 0;
   let totalFailures = 0;
   for (;;) {
     const sep = path.includes('?') ? '&' : '?';
-    const url = path + sep + 'limit=5&batchSize=2&offset=' + offset;
-    log.textContent = label + ': running chunk offset ' + offset + ' (limit=5, batchSize=2)…\\n' + log.textContent;
-    const result = await api(url, { method: 'POST' }, 120000);
+    const url = path + sep + 'offset=' + offset + '&limit=' + limit + '&batchSize=' + batchSize;
+    if (options.activeRisks) {
+      log.textContent = 'Ingesting active risks: ' + processed + ' of ' + totalVendors + ' vendors processed.\\n' + log.textContent;
+    } else {
+      log.textContent = label + ': running chunk offset ' + offset + ' (limit=' + limit + ', batchSize=' + batchSize + ')…\\n' + log.textContent;
+    }
+    let result;
+    try {
+      result = await api(url, { method: 'POST' }, 120000);
+    } catch (error) {
+      if (options.activeRisks) {
+        log.textContent = 'Active risk ingestion chunk failed. Check ingestion_errors and /api/debug/upguard-vendor-risks?hostname=adobe.com.\\n' + log.textContent;
+      }
+      throw error;
+    }
+    const selectedVendorCount = result.selectedVendorCount || 0;
+    processed += selectedVendorCount;
     totalSuccess += result.successCount || 0;
     totalFailures += result.failureCount || 0;
-    log.textContent = label + ': finished chunk offset ' + offset + ', processed=' + (result.vendorsProcessed ?? result.selectedVendorCount ?? 0) + ', successes=' + totalSuccess + ', failures=' + totalFailures + '\\n' + JSON.stringify(result, null, 2);
-    if (result.hasMore === false || (result.selectedVendorCount || 0) < 5) break;
-    offset += 5;
+    if (options.activeRisks) {
+      log.textContent = 'Ingesting active risks: ' + processed + ' of ' + totalVendors + ' vendors processed.\\n' + JSON.stringify(result, null, 2);
+    } else {
+      log.textContent = label + ': finished chunk offset ' + offset + ', processed=' + (result.vendorsProcessed ?? selectedVendorCount) + ', successes=' + totalSuccess + ', failures=' + totalFailures + '\\n' + JSON.stringify(result, null, 2);
+    }
+    if (result.hasMore === false || selectedVendorCount === 0 || selectedVendorCount < limit) break;
+    offset = result.nextOffset ?? (offset + selectedVendorCount);
     await new Promise(resolve => setTimeout(resolve, 50));
   }
   log.textContent = label + ': complete. Refreshing dashboard from D1…\\n' + log.textContent;
@@ -1721,7 +1816,7 @@ document.querySelectorAll('[data-ingest]').forEach(btn => btn.addEventListener('
     const job = btn.dataset.ingest;
     if (job === 'domains') await runChunked('/api/ingest/chunk', 'Domain details ingestion');
     if (job === 'portfolio') await runChunked('/api/ingest/portfolio-risk-profile', 'Portfolio risk profile ingestion');
-    if (job === 'vendorRisks') await runChunked('/api/ingest/vendor-risks', 'Vendor active risks ingestion');
+    if (job === 'vendorRisks') await runChunked('/api/ingest/vendor-risks', 'Active risks ingestion', { activeRisks: true, totalVendors: 80, limit: 5, batchSize: 2 });
     if (job === 'riskDiff') await runChunked('/api/ingest/risk-diff?days=30', '30-day risk diff ingestion');
   } catch (e) {
     $('ingest-log').textContent = 'Ingestion failed: ' + e.message;
