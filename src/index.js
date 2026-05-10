@@ -151,7 +151,13 @@ export default {
 
       if (request.method === "POST" && pathname === "/api/ingest/risk-diff") {
         const options = getIngestionOptions(url, { defaultLimit: 5, defaultBatchSize: 2 });
-        const result = await runRiskDiffIngestion(env, { trigger: "api_risk_diff", days: url.searchParams.get("days") || 30, ...options });
+        const result = await runRiskDiffIngestion(env, {
+          trigger: "api_risk_diff",
+          days: url.searchParams.get("days") || 30,
+          startDate: url.searchParams.get("start_date"),
+          endDate: url.searchParams.get("end_date"),
+          ...options,
+        });
         return json(result, result.failureCount > 0 ? 207 : 200);
       }
 
@@ -401,60 +407,76 @@ function fetchVendorActiveRisksResponse(env, hostname) {
   return fetchUpGuard(env, url);
 }
 
-async function runRiskDiffIngestion(env, { trigger = "manual", days = 30, batchSize = DEFAULT_BATCH_SIZE, vendors = PORTFOLIO_VENDORS } = {}) {
+async function runRiskDiffIngestion(env, { trigger = "manual", days = 30, startDate = null, endDate = null, batchSize = DEFAULT_BATCH_SIZE, vendors = PORTFOLIO_VENDORS } = {}) {
   assertDb(env);
   assertApiKey(env);
   await assertD1Schema(env, ["vendor_risk_events", "ingestion_errors"]);
   const selectedVendors = normalizeVendorList(vendors);
   const boundedBatchSize = clamp(batchSize, 1, MAX_BATCH_SIZE);
-  const boundedDays = clamp(days, 1, 30);
-  const endDate = new Date();
-  const startDate = new Date(endDate.getTime() - boundedDays * 24 * 60 * 60 * 1000);
-  const range = { startDate: startDate.toISOString(), endDate: endDate.toISOString() };
+  const range = buildRiskDiffRange({ days, startDate, endDate });
   const successes = [];
   const failures = [];
   for (const batch of chunk(selectedVendors, boundedBatchSize)) {
-    const results = await Promise.all(batch.map((hostname) => ingestRiskDiff(env, hostname, range)));
-    for (const result of results) result.ok ? successes.push(result.hostname) : failures.push(result);
+    const results = await Promise.all(batch.map((vendorPrimaryHostname) => ingestRiskDiff(env, vendorPrimaryHostname, range)));
+    for (const result of results) result.ok ? successes.push(result.vendorPrimaryHostname) : failures.push(result);
   }
-  return { portfolioName: PORTFOLIO_NAME, trigger, days: boundedDays, ...range, selectedVendorCount: selectedVendors.length, vendorsProcessed: selectedVendors.length, successCount: successes.length, failureCount: failures.length, failures, completedAt: new Date().toISOString() };
+  return { portfolioName: PORTFOLIO_NAME, trigger, days: range.days, startDate: range.startDate, endDate: range.endDate, selectedVendorCount: selectedVendors.length, vendorsProcessed: selectedVendors.length, successCount: successes.length, failureCount: failures.length, failures, completedAt: new Date().toISOString() };
 }
 
-async function ingestRiskDiff(env, hostname, range) {
+async function ingestRiskDiff(env, vendorPrimaryHostname, range) {
+  const cleanVendorPrimaryHostname = normalizeHostname(vendorPrimaryHostname);
   try {
-    const data = await fetchRiskDiff(env, hostname, range);
-    const events = normalizeRiskDiffEvents(hostname, data);
+    const data = await fetchRiskDiff(env, cleanVendorPrimaryHostname, range);
+    const events = normalizeRiskDiffEvents(cleanVendorPrimaryHostname, data, range);
     for (const batch of chunk(events.map((event) => insertRiskEventStatement(env.DB, event)), 50)) {
       if (batch.length) await env.DB.batch(batch);
     }
-    return { ok: true, hostname, eventCount: events.length };
+    return { ok: true, hostname: cleanVendorPrimaryHostname, vendorPrimaryHostname: cleanVendorPrimaryHostname, eventCount: events.length };
   } catch (error) {
-    const failure = { ok: false, hostname, errorMessage: getErrorMessage(error), statusCode: error.statusCode || null, responseBody: error.responseBody || null };
+    const failure = { ok: false, hostname: cleanVendorPrimaryHostname, vendorPrimaryHostname: cleanVendorPrimaryHostname, errorMessage: getErrorMessage(error), statusCode: error.statusCode || null, responseBody: error.responseBody || null };
     await logIngestionError(env.DB, failure);
     return failure;
   }
 }
 
-async function fetchRiskDiff(env, hostname, { startDate, endDate }) {
-  const response = await fetchRiskDiffResponse(env, hostname, startDate, endDate);
-  return parseUpGuardResponse(response, `risk diff for ${hostname}`);
+async function fetchRiskDiff(env, vendorPrimaryHostname, { startDate, endDate }) {
+  const response = await fetchRiskDiffResponse(env, vendorPrimaryHostname, startDate, endDate, true);
+  return parseUpGuardResponse(response, `risk diff for ${vendorPrimaryHostname}`);
 }
 
-function buildRiskDiffUrl(hostname, startDate, endDate) {
-  const vendorPrimaryHostname = normalizeHostname(hostname);
-  if (!vendorPrimaryHostname) {
-    throw new Error("Missing vendor_primary_hostname for risk diff request.");
+function buildRiskDiffUrl(vendorPrimaryHostname, startDate, endDate, includeSources = true) {
+  const cleanVendorPrimaryHostname = normalizeHostname(vendorPrimaryHostname);
+  if (!cleanVendorPrimaryHostname) {
+    throw new Error("vendor_primary_hostname is required for UpGuard risk diff.");
+  }
+  if (!startDate) {
+    throw new Error("start_date is required for UpGuard risk diff.");
   }
 
   const url = new URL(UPGUARD_RISK_DIFF_ENDPOINT);
-  url.searchParams.set("vendor_primary_hostname", vendorPrimaryHostname);
+  url.searchParams.set("vendor_primary_hostname", cleanVendorPrimaryHostname);
   url.searchParams.set("start_date", startDate);
-  url.searchParams.set("end_date", endDate);
+  if (endDate) url.searchParams.set("end_date", endDate);
+  url.searchParams.set("include_sources", includeSources ? "true" : "false");
   return url;
 }
 
-function fetchRiskDiffResponse(env, hostname, startDate, endDate) {
-  return fetchUpGuard(env, buildRiskDiffUrl(hostname, startDate, endDate));
+function fetchRiskDiffResponse(env, vendorPrimaryHostname, startDate, endDate, includeSources = true) {
+  return fetchUpGuard(env, buildRiskDiffUrl(vendorPrimaryHostname, startDate, endDate, includeSources));
+}
+
+
+function buildRiskDiffRange({ days = 30, startDate = null, endDate = null } = {}) {
+  const boundedDays = clamp(days, 1, 30);
+  const maxStartDate = new Date(Date.now() - 2 * 365 * 24 * 60 * 60 * 1000);
+  const end = endDate ? new Date(endDate) : new Date();
+  if (Number.isNaN(end.getTime())) throw new Error("end_date must be a valid RFC3339 date for UpGuard risk diff.");
+  let start = startDate ? new Date(startDate) : new Date(end.getTime() - boundedDays * 24 * 60 * 60 * 1000);
+  if (Number.isNaN(start.getTime())) throw new Error("start_date must be a valid RFC3339 date for UpGuard risk diff.");
+  if (start < maxStartDate) start = maxStartDate;
+  const minStartForInterval = new Date(end.getTime() - 30 * 24 * 60 * 60 * 1000);
+  if (start < minStartForInterval) start = minStartForInterval;
+  return { days: boundedDays, startDate: start.toISOString(), endDate: end.toISOString() };
 }
 
 async function parseUpGuardResponse(response, label) {
@@ -790,7 +812,7 @@ async function getDashboardOverview(env) {
   ).first();
   const changes = await env.DB.prepare(
     `SELECT
-       COALESCE(SUM(CASE WHEN LOWER(COALESCE(event_type, '')) = 'new' THEN 1 ELSE 0 END), 0) AS new_risk_count,
+       COALESCE(SUM(CASE WHEN LOWER(COALESCE(event_type, '')) IN ('introduced', 'new') THEN 1 ELSE 0 END), 0) AS new_risk_count,
        COALESCE(SUM(CASE WHEN LOWER(COALESCE(event_type, '')) = 'resolved' THEN 1 ELSE 0 END), 0) AS resolved_risk_count
      FROM vendor_risk_events
      WHERE captured_at >= datetime('now', '-30 days')`
@@ -946,9 +968,14 @@ async function getDashboardChanges(env) {
   assertDb(env);
   await assertD1Schema(env, ["vendor_risk_events"]);
   const { results } = await env.DB.prepare(
-    `SELECT * FROM vendor_risk_events ORDER BY captured_at DESC, id DESC LIMIT 200`
+    `SELECT vendor_primary_hostname, event_type, title, finding, category, risk_type, risk_subtype, severity,
+            severity_name, affected_hostnames_json, sources_json, event_start, event_end, captured_at
+     FROM vendor_risk_events
+     ORDER BY captured_at DESC, severity DESC
+     LIMIT 200`
   ).all();
-  return { portfolioName: PORTFOLIO_NAME, events: (results || []).map(hydrateStoredRisk) };
+  const changes = (results || []).map(hydrateStoredRiskEvent);
+  return { portfolioName: PORTFOLIO_NAME, changes };
 }
 
 async function getRemediationCampaigns(env) {
@@ -985,32 +1012,48 @@ async function getDebugUpGuardVendorRisks(env, url) {
 
 async function getDebugUpGuardRiskDiff(env, url) {
   assertApiKey(env);
-  const vendorPrimaryHostname =
+  const requestedVendorPrimaryHostname =
     normalizeHostname(url.searchParams.get("vendor_primary_hostname")) ||
-    normalizeHostname(url.searchParams.get("hostname")) ||
-    "adobe.com";
-  const days = clamp(url.searchParams.get("days") || 30, 1, 30);
-  const endDate = new Date();
-  const startDate = new Date(endDate.getTime() - days * 24 * 60 * 60 * 1000);
-  const startDateIso = startDate.toISOString();
-  const endDateIso = endDate.toISOString();
-  const upstreamUrl = buildRiskDiffUrl(vendorPrimaryHostname, startDateIso, endDateIso);
+    normalizeHostname(url.searchParams.get("hostname"));
+  if (!requestedVendorPrimaryHostname) {
+    throw new Error("vendor_primary_hostname or hostname is required for UpGuard risk diff debug.");
+  }
+  const range = buildRiskDiffRange({ days: url.searchParams.get("days") || 30 });
+  const upstreamUrl = buildRiskDiffUrl(requestedVendorPrimaryHostname, range.startDate, range.endDate, true);
   const response = await fetchUpGuard(env, upstreamUrl);
-  const summary = await summarizeDebugResponse(response);
+  const summary = await summarizeRiskDiffDebugResponse(response);
   return {
-    requestedHostname: vendorPrimaryHostname,
-    vendorPrimaryHostname,
-    days,
-    startDate: startDateIso,
-    endDate: endDateIso,
-    upstreamUrl: upstreamUrl.toString(),
+    requestedVendorPrimaryHostname,
     upstreamParams: {
-      vendor_primary_hostname: vendorPrimaryHostname,
-      start_date: startDateIso,
-      end_date: endDateIso,
+      vendor_primary_hostname: requestedVendorPrimaryHostname,
+      start_date: range.startDate,
+      end_date: range.endDate,
+      include_sources: true,
     },
     ...summary,
   };
+}
+
+
+async function summarizeRiskDiffDebugResponse(response) {
+  const contentType = response.headers.get("content-type") || "";
+  const body = await response.text();
+  const data = body && contentType.toLowerCase().includes("application/json") ? parseJson(body, null) : null;
+  const risksIntroduced = Array.isArray(data?.risksIntroduced) ? data.risksIntroduced : [];
+  const risksResolved = Array.isArray(data?.risksResolved) ? data.risksResolved : [];
+  const result = {
+    status: response.status,
+    ok: response.ok,
+    contentType,
+    topLevelKeys: data && typeof data === "object" && !Array.isArray(data) ? Object.keys(data) : [],
+    risksIntroducedCount: risksIntroduced.length,
+    risksResolvedCount: risksResolved.length,
+    firstIntroducedSample: risksIntroduced[0] || null,
+    firstResolvedSample: risksResolved[0] || null,
+    errorBody: null,
+  };
+  if (!response.ok) result.errorBody = body.slice(0, 2000);
+  return result;
 }
 
 async function summarizeDebugResponse(response) {
@@ -1062,9 +1105,9 @@ function insertRiskEventStatement(db, event) {
   return db.prepare(
     `INSERT INTO vendor_risk_events (
       vendor_primary_hostname, event_type, title, finding, category, risk_type, risk_subtype, severity,
-      severity_name, affected_hostnames_json, event_start, event_end, raw_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).bind(event.vendorPrimaryHostname, event.eventType, event.title, event.finding, event.category, event.riskType, event.riskSubtype, event.severity, event.severityName, event.affectedHostnamesJson, event.eventStart, event.eventEnd, event.rawJson);
+      severity_name, affected_hostnames_json, sources_json, event_start, event_end, raw_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(event.vendorPrimaryHostname, event.eventType, event.title, event.finding, event.category, event.riskType, event.riskSubtype, event.severity, event.severityName, event.affectedHostnamesJson, event.sourcesJson, event.eventStart, event.eventEnd, event.rawJson);
 }
 
 function normalizeCommonRisk(risk) {
@@ -1088,26 +1131,33 @@ function normalizeVendorRisk(hostname, risk) {
   };
 }
 
-function normalizeRiskDiffEvents(hostname, data) {
-  const eventGroups = [
-    ["new", firstDefined(data?.new, data?.new_risks, data?.newRisks, data?.created, data?.added)],
-    ["resolved", firstDefined(data?.resolved, data?.resolved_risks, data?.resolvedRisks, data?.removed)],
-    ["changed", firstDefined(data?.changed, data?.changed_risks, data?.changedRisks, data?.updated)],
+function normalizeRiskDiffEvents(vendorPrimaryHostname, data, range) {
+  const introduced = Array.isArray(data?.risksIntroduced) ? data.risksIntroduced : [];
+  const resolved = Array.isArray(data?.risksResolved) ? data.risksResolved : [];
+
+  return [
+    ...introduced.map((risk) => normalizeRiskDiffEvent(vendorPrimaryHostname, "introduced", risk, range)),
+    ...resolved.map((risk) => normalizeRiskDiffEvent(vendorPrimaryHostname, "resolved", risk, range)),
   ];
-  const grouped = eventGroups.flatMap(([eventType, value]) => asArray(value).map((risk) => normalizeRiskEvent(hostname, eventType, risk)));
-  if (grouped.length) return grouped;
-  return extractRiskRecords(data).map((risk) => normalizeRiskEvent(hostname, stringOrNull(firstDefined(risk.event_type, risk.eventType, risk.type)) || "changed", risk));
 }
 
-function normalizeRiskEvent(hostname, eventType, risk) {
-  const base = normalizeRiskFields(risk);
+function normalizeRiskDiffEvent(vendorPrimaryHostname, eventType, risk, range = {}) {
+  const affectedSources = firstDefined(risk?.hostnames, risk?.domains, risk?.sources, risk?.ips, risk?.ip_addresses, risk?.ports, []);
   return {
-    ...base,
-    vendorPrimaryHostname: hostname,
+    vendorPrimaryHostname,
     eventType,
-    affectedHostnamesJson: stringifyJson(extractAffectedHostnames(risk)),
-    eventStart: stringOrNull(firstDefined(risk.event_start, risk.eventStart, risk.start_date, risk.startDate, risk.first_detected, risk.firstDetected)),
-    eventEnd: stringOrNull(firstDefined(risk.event_end, risk.eventEnd, risk.end_date, risk.endDate, risk.resolved_at, risk.resolvedAt)),
+    title: stringOrNull(firstDefined(risk?.title, risk?.finding, risk?.risk, risk?.name)),
+    finding: stringOrNull(firstDefined(risk?.finding, risk?.title, risk?.risk, risk?.name)),
+    category: stringOrNull(risk?.category),
+    riskType: stringOrNull(firstDefined(risk?.riskType, risk?.risk_type)),
+    riskSubtype: stringOrNull(firstDefined(risk?.riskSubtype, risk?.risk_subtype)),
+    severity: toNullableInteger(risk?.severity ?? null),
+    severityName: stringOrNull(firstDefined(risk?.severityName, risk?.severity_name)),
+    affectedHostnamesJson: stringifyJson(Array.isArray(affectedSources) ? affectedSources : []),
+    sourcesJson: stringifyJson(Array.isArray(risk?.sources) ? risk.sources : []),
+    eventStart: stringOrNull(firstDefined(risk?.event_start, risk?.eventStart, risk?.start_date, risk?.startDate, range.startDate)),
+    eventEnd: stringOrNull(firstDefined(risk?.event_end, risk?.eventEnd, risk?.end_date, risk?.endDate, range.endDate)),
+    rawJson: stringifyJson(risk),
   };
 }
 
@@ -1187,7 +1237,26 @@ function classifyCampaign(risk) {
 }
 
 function hydrateStoredRisk(risk) {
-  return { ...risk, affectedHostnames: parseJson(risk.affected_hostnames_json, []), raw: parseJson(risk.raw_json, {}) };
+  return { ...risk, affectedHostnames: parseJson(risk.affected_hostnames_json, []), sources: parseJson(risk.sources_json, []), raw: parseJson(risk.raw_json, {}) };
+}
+
+function hydrateStoredRiskEvent(event) {
+  return {
+    vendor_primary_hostname: event.vendor_primary_hostname,
+    event_type: event.event_type,
+    title: event.title,
+    finding: event.finding,
+    category: event.category,
+    risk_type: event.risk_type,
+    risk_subtype: event.risk_subtype,
+    severity: event.severity,
+    severity_name: event.severity_name,
+    affected_hostnames: parseJson(event.affected_hostnames_json, []),
+    sources: parseJson(event.sources_json, []),
+    event_start: event.event_start,
+    event_end: event.event_end,
+    captured_at: event.captured_at,
+  };
 }
 
 function asArray(value) {
@@ -1296,6 +1365,21 @@ function getDebugSecret(env) {
 async function assertD1Schema(env, tableNames = CURRENT_D1_TABLES) {
   const missingTables = await getMissingD1Tables(env.DB, tableNames);
   if (missingTables.length > 0) throw new SchemaNotInitializedError(missingTables);
+  if (tableNames.includes("vendor_risk_events")) await ensureVendorRiskEventsSourcesColumn(env.DB);
+}
+
+async function ensureVendorRiskEventsSourcesColumn(db) {
+  if (await d1ColumnExists(db, "vendor_risk_events", "sources_json")) return;
+  try {
+    await db.prepare("ALTER TABLE vendor_risk_events ADD COLUMN sources_json TEXT NOT NULL DEFAULT '[]'").run();
+  } catch (error) {
+    if (!/duplicate column|already exists/i.test(getErrorMessage(error))) throw error;
+  }
+}
+
+async function d1ColumnExists(db, tableName, columnName) {
+  const { results } = await db.prepare(`PRAGMA table_info(${tableName})`).all();
+  return (results || []).some((column) => column.name === columnName);
 }
 
 async function getMissingD1Tables(db, tableNames) {
@@ -1532,7 +1616,7 @@ async function load() {
     ['severities', '/api/dashboard/severity-breakdown', d => state.severities = Array.isArray(d.severities) ? d.severities : [], d => Boolean(d && Array.isArray(d.severities) && d.severities.length)],
     ['categories', '/api/dashboard/categories', d => state.categories = Array.isArray(d.categories) ? d.categories : [], d => Boolean(d && Array.isArray(d.categories) && d.categories.length)],
     ['ingestStatus', '/api/ingest/status', d => state.ingestStatus = d, d => Boolean(d && (d.hasCachedData || d.latestRun || d.latestRuns || d.lastIngestionTimestamps))],
-    ['changes', '/api/dashboard/changes', d => state.changes = Array.isArray(d.events) ? d.events : [], d => Boolean(d && Array.isArray(d.events) && d.events.length)],
+    ['changes', '/api/dashboard/changes', d => state.changes = Array.isArray(d.changes) ? d.changes : (Array.isArray(d.events) ? d.events : []), d => Boolean(d && ((Array.isArray(d.changes) && d.changes.length) || (Array.isArray(d.events) && d.events.length)))],
     ['campaigns', '/api/dashboard/remediation-campaigns', d => state.campaigns = Array.isArray(d.campaigns) ? d.campaigns : [], d => Boolean(d && Array.isArray(d.campaigns) && d.campaigns.length)]
   ];
   const results = await Promise.allSettled(endpoints.map(([, path, assign, hasRows]) => api(path).then(data => {
@@ -1586,7 +1670,7 @@ function renderVendors() {
 function renderRisks() { $('common-risks').innerHTML = errorCard('risks') + '<div class="card"><h2>Common Risks</h2>' + riskTable(state.risks || [], true) + '</div>'; }
 function renderChanges() {
   const rows = state.changes || [];
-  const body = rows.length ? rows.map(e => '<tr><td>' + esc(e.vendor_primary_hostname) + '</td><td>' + esc(e.event_type || 'changed') + '</td><td>' + esc(e.title || e.finding || 'Untitled') + '</td><td>' + badge(e.severity_name || e.severity) + '</td><td>' + esc((e.affectedHostnames || []).join(', ')) + '</td><td>' + esc(e.captured_at || '—') + '</td></tr>').join('') : '<tr><td colspan="6">No risk diff events are available.</td></tr>';
+  const body = rows.length ? rows.map(e => '<tr><td>' + esc(e.vendor_primary_hostname) + '</td><td>' + esc(e.event_type || 'changed') + '</td><td>' + esc(e.title || e.finding || 'Untitled') + '</td><td>' + badge(e.severity_name || e.severity) + '</td><td>' + esc((e.affected_hostnames || e.affectedHostnames || []).join(', ')) + '</td><td>' + esc(e.captured_at || '—') + '</td></tr>').join('') : '<tr><td colspan="6">No risk diff events are available.</td></tr>';
   $('changes').innerHTML = '<div class="card"><h2>Changes Feed</h2><table><thead><tr><th>Vendor</th><th>Event</th><th>Risk/finding</th><th>Severity</th><th>Affected hostnames</th><th>Captured</th></tr></thead><tbody>' + body + '</tbody></table></div>';
 }
 function renderCampaigns() {
