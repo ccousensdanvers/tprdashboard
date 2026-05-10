@@ -21,13 +21,13 @@ database_id = "0aae51e4-fca2-4f5a-8dd2-2f9ea7b50e67"
 # - UPGUARD_API_KEY (set with `wrangler secret put UPGUARD_API_KEY`)
 [vars]
 REQUIRE_ACCESS = "0"
-UPGUARD_PORTFOLIO_ID = "Commonwealth%20Common%20Vendors"
+UPGUARD_PORTFOLIO_ID = "Commonwealth Common Vendors"
 
 [env.staging]
 # Keep same entry file; secrets are environment-specific.
 [env.staging.vars]
 REQUIRE_ACCESS = "0"
-UPGUARD_PORTFOLIO_ID = "Commonwealth%20Common%20Vendors"
+UPGUARD_PORTFOLIO_ID = "Commonwealth Common Vendors"
 
 [[env.staging.d1_databases]]
 binding = "DB"
@@ -37,7 +37,7 @@ database_id = "0aae51e4-fca2-4f5a-8dd2-2f9ea7b50e67"
 [env.production]
 [env.production.vars]
 REQUIRE_ACCESS = "0"
-UPGUARD_PORTFOLIO_ID = "Commonwealth%20Common%20Vendors"
+UPGUARD_PORTFOLIO_ID = "Commonwealth Common Vendors"
 
 [[env.production.d1_databases]]
 binding = "DB"
