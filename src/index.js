@@ -140,14 +140,15 @@ async function loadPortfolioChanges(env, days) {
     return { portfolioName: PORTFOLIO_NAME, source: "sample", warning: missingConfigWarning(env), days, changes: sampleChanges(days), generatedAt: new Date().toISOString() };
   }
 
+  const portfolioId = getConfiguredPortfolioId(env);
+
   try {
-    const params = { portfolios: getConfiguredPortfolioId(env), days: String(days) };
-    const data = await fetchUpGuardJson(env, "/risk/vendors/diff?" + strictQueryString(params));
-    const changes = extractItems(data, ["changes", "events", "results", "data", "diffs"]).map(normalizeChangeRecord).sort(sortNewestChangeFirst);
-    // TODO(D1): persist diff events and derived snapshots for trend analysis and resolved-risk reporting.
-    return { portfolioName: PORTFOLIO_NAME, portfolioId: getConfiguredPortfolioId(env), source: "upguard", warning: null, days, changes, generatedAt: new Date().toISOString() };
+    const pages = await fetchPortfolioRiskProfilePages(env, portfolioId);
+    const changes = riskProfilePagesToChangeRecords(pages, days).sort(sortNewestChangeFirst);
+    // TODO(D1): persist risk-profile snapshots here for true longitudinal portfolio change reporting.
+    return { portfolioName: PORTFOLIO_NAME, portfolioId, source: "upguard", warning: null, days, changes, generatedAt: new Date().toISOString() };
   } catch (e) {
-    return { portfolioName: PORTFOLIO_NAME, portfolioId: getConfiguredPortfolioId(env), source: "sample", warning: { code: "upguard_diff_unavailable", message: (e && e.message ? e.message : String(e)) + "; showing sample change events." }, days, changes: sampleChanges(days), generatedAt: new Date().toISOString() };
+    return { portfolioName: PORTFOLIO_NAME, portfolioId, source: "sample", warning: { code: "upguard_risk_profile_changes_unavailable", message: (e && e.message ? e.message : String(e)) + "; showing sample change events." }, days, changes: sampleChanges(days), generatedAt: new Date().toISOString() };
   }
 }
 
@@ -403,6 +404,30 @@ function normalizeChangeRecord(change) {
     affectedHostname: change.hostname || change.domain || change.asset || change.affected_hostname || "—",
     affectedAsset: change.hostname || change.domain || change.asset || change.affected_hostname || "—",
   };
+}
+
+function riskProfilePagesToChangeRecords(pages, days) {
+  const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  return (pages || [])
+    .flatMap((page) => extractItems(page, ["risks", "findings", "grouped_risks", "common_risks", "results", "data"]))
+    .map(normalizePortfolioRisk)
+    .flatMap((risk) => {
+      const detectedAt = risk.firstDetected || new Date().toISOString();
+      if (risk.firstDetected && new Date(detectedAt) < cutoff) return [];
+      const affectedHostnames = risk.affectedHostnames.length ? risk.affectedHostnames : ["—"];
+      return affectedHostnames.map((hostname) => ({
+        id: [risk.id, hostname, detectedAt].join(":"),
+        date: detectedAt,
+        dateDetected: detectedAt,
+        vendor: hostname,
+        changeType: "New Risk",
+        finding: risk.name,
+        findingName: risk.name,
+        severity: risk.severity,
+        affectedHostname: hostname,
+        affectedAsset: hostname,
+      }));
+    });
 }
 
 function normalizeRemediationCampaigns(risks) {
