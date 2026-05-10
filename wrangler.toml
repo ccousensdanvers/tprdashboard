@@ -12,15 +12,15 @@ enabled = true
 # - UPGUARD_PORTFOLIO_ID (set below per environment)
 [vars]
 REQUIRE_ACCESS = "0"
-UPGUARD_PORTFOLIO_ID = ""
+UPGUARD_PORTFOLIO_ID = "Commonwealth Common Vendors"
 
 [env.staging]
 # Keep same entry file; secrets are environment-specific
 [env.staging.vars]
 REQUIRE_ACCESS = "0"
-UPGUARD_PORTFOLIO_ID = ""
+UPGUARD_PORTFOLIO_ID = "Commonwealth Common Vendors"
 
 [env.production]
 [env.production.vars]
 REQUIRE_ACCESS = "0"
-UPGUARD_PORTFOLIO_ID = ""
+UPGUARD_PORTFOLIO_ID = "Commonwealth Common Vendors"
