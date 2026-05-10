@@ -13,7 +13,7 @@ crons = ["0 2 * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "tprisk"
-database_id = "REPLACE_WITH_REAL_DATABASE_ID"
+database_id = "0aae51e4-fca2-4f5a-8dd2-2f9ea7b50e67"
 
 # Required secret for live UpGuard ingestion:
 # - UPGUARD_API_KEY (set with `wrangler secret put UPGUARD_API_KEY`)
@@ -28,7 +28,7 @@ REQUIRE_ACCESS = "0"
 [[env.staging.d1_databases]]
 binding = "DB"
 database_name = "tprisk"
-database_id = "REPLACE_WITH_REAL_DATABASE_ID"
+database_id = "0aae51e4-fca2-4f5a-8dd2-2f9ea7b50e67"
 
 [env.production]
 [env.production.vars]
@@ -37,4 +37,4 @@ REQUIRE_ACCESS = "0"
 [[env.production.d1_databases]]
 binding = "DB"
 database_name = "tprisk"
-database_id = "REPLACE_WITH_REAL_DATABASE_ID"
+database_id = "0aae51e4-fca2-4f5a-8dd2-2f9ea7b50e67"
