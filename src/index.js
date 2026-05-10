@@ -1409,6 +1409,7 @@ function renderDashboardShell() {
     .critical { background: #7f1d1d; color: #fee2e2; } .high { background: #9a3412; color: #ffedd5; } .medium { background: #854d0e; color: #fef3c7; } .low { background: #14532d; color: #dcfce7; } .pass { background: #1e3a8a; color: #dbeafe; }
     .split { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
     .muted { color: #94a3b8; } .link { color: #93c5fd; cursor: pointer; font-weight: 800; }
+    .vendor-link { appearance: none; background: transparent; border: 0; border-radius: 0; padding: 0; color: #93c5fd; } .vendor-link:hover { background: transparent; color: #bfdbfe; text-decoration: underline; }
     .hidden { display: none; }
     pre { white-space: pre-wrap; overflow: auto; background: #020617; border-radius: 14px; padding: 14px; color: #cbd5e1; max-height: 360px; }
     @media (max-width: 980px) { .grid, .split { grid-template-columns: 1fr; } }
@@ -1442,8 +1443,33 @@ function renderDashboardShell() {
 const EMPTY_MESSAGE = 'No cached risk data found. Run manual ingestion to populate the dashboard.';
 const state = { overview: null, vendors: [], risks: [], severities: [], categories: [], changes: [], campaigns: [], ingestStatus: null, errors: {}, endpointDiagnostics: [] };
 const $ = id => document.getElementById(id);
-function esc(value) { return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-function jsString(value) { return JSON.stringify(String(value || '')); }
+const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;"
+}[char]));
+function renderError(title, message) {
+  return '<div class="card error-card"><h2>' + esc(title) + '</h2><pre>' + esc(message || 'Unknown error') + '</pre></div>';
+}
+window.addEventListener("error", function(event) {
+  const status = document.getElementById("status");
+  if (status) {
+    status.innerHTML = "<strong>Dashboard JavaScript error</strong><pre>" +
+      esc(event.message || "Unknown error") +
+      "</pre>";
+  }
+});
+window.addEventListener("unhandledrejection", function(event) {
+  const status = document.getElementById("status");
+  if (status) {
+    const reason = event.reason && event.reason.stack ? event.reason.stack : String(event.reason || "Unknown rejection");
+    status.innerHTML = "<strong>Dashboard async error</strong><pre>" +
+      esc(reason) +
+      "</pre>";
+  }
+});
 function badge(value) { const v = String(value || 'unknown'); return '<span class="badge ' + esc(v.toLowerCase()) + '">' + esc(v) + '</span>'; }
 async function api(path, options = {}, timeoutMs = 8000) {
   const controller = new AbortController();
@@ -1525,8 +1551,9 @@ function renderOverview() {
 }
 function renderVendors() {
   const rows = state.vendors || [];
-  const body = rows.length ? rows.map(v => { const hostname = v.hostname || v.vendor_primary_hostname || ''; return '<tr><td><span class="link" onclick="showVendor(' + esc(jsString(hostname)) + ')">' + esc(hostname) + '</span></td><td>' + esc(v.vendor_primary_hostname || hostname) + '</td><td>' + esc(v.score ?? v.automated_score ?? '—') + '</td><td>' + esc(v.scanned_at || '—') + '</td><td>' + esc(v.total_checks ?? 0) + '</td><td>' + esc(v.failed_checks ?? 0) + '</td><td>' + esc(v.waived_checks ?? 0) + '</td></tr>'; }).join('') : '<tr><td colspan="7">' + EMPTY_MESSAGE + '</td></tr>';
+  const body = rows.length ? rows.map(v => { const hostname = v.hostname || v.vendor_primary_hostname || ''; return '<tr><td><button type="button" class="vendor-link link" data-hostname="' + esc(hostname) + '">' + esc(hostname) + '</button></td><td>' + esc(v.vendor_primary_hostname || hostname) + '</td><td>' + esc(v.score ?? v.automated_score ?? '—') + '</td><td>' + esc(v.scanned_at || '—') + '</td><td>' + esc(v.total_checks ?? 0) + '</td><td>' + esc(v.failed_checks ?? 0) + '</td><td>' + esc(v.waived_checks ?? 0) + '</td></tr>'; }).join('') : '<tr><td colspan="7">' + EMPTY_MESSAGE + '</td></tr>';
   $('vendors').innerHTML = errorCard('vendors') + '<div class="card"><h2>Vendor Domain Table</h2><table><thead><tr><th>Hostname</th><th>Vendor primary hostname</th><th>Automated score</th><th>Scanned</th><th>Total checks</th><th>Failed</th><th>Waived</th></tr></thead><tbody>' + body + '</tbody></table></div>';
+  bindVendorLinks();
 }
 function renderRisks() { $('common-risks').innerHTML = errorCard('risks') + '<div class="card"><h2>Common Risks</h2>' + riskTable(state.risks || [], true) + '</div>'; }
 function renderChanges() {
@@ -1542,7 +1569,7 @@ function renderCampaigns() {
 function renderSeverity() { $('severity').innerHTML = errorCard('severities') + errorCard('categories') + '<div class="split"><div class="card"><h2>Severity Breakdown</h2>' + list(state.severities, 'severity_name') + '</div><div class="card"><h2>Category Grouping</h2>' + list(state.categories, 'category') + '</div></div>'; }
 async function showVendor(hostname) {
   show('vendor-detail'); $('vendor-detail').innerHTML = '<div class="card">Loading ' + esc(hostname) + '…</div>';
-  try { const data = await api('/api/vendor/' + encodeURIComponent(hostname)); const vendor = data.vendor || {}; $('vendor-detail').innerHTML = '<div class="card"><h2>' + esc(vendor.hostname || vendor.vendor_primary_hostname || hostname) + '</h2><p>Vendor primary hostname: <strong>' + esc(vendor.vendor_primary_hostname || vendor.hostname || '—') + '</strong></p><p>Score: <strong>' + esc(vendor.score ?? vendor.automated_score ?? '—') + '</strong> · Scanned: ' + esc(vendor.scanned_at || '—') + '</p></div>' + '<div class="card"><h2>Domain scan checks</h2>' + checkTable(data.checkResults || []) + '</div><div class="split"><div class="card"><h2>Active Risks</h2>' + riskTable(data.activeRisks || []) + '</div><div class="card"><h2>Recent Changes</h2>' + eventMiniTable(data.recentChanges || []) + '</div></div><div class="card"><h2>Waived Checks</h2>' + checkTable(data.waivedCheckResults || []) + '</div>'; } catch (error) { $('vendor-detail').innerHTML = '<div class="card error-card"><h2>Vendor failed to load</h2><p>' + esc(error.message) + '</p></div>'; }
+  try { const data = await api('/api/vendor/' + encodeURIComponent(hostname)); const vendor = data.vendor || {}; $('vendor-detail').innerHTML = '<div class="card"><h2>' + esc(vendor.hostname || vendor.vendor_primary_hostname || hostname) + '</h2><p>Vendor primary hostname: <strong>' + esc(vendor.vendor_primary_hostname || vendor.hostname || '—') + '</strong></p><p>Score: <strong>' + esc(vendor.score ?? vendor.automated_score ?? '—') + '</strong> · Scanned: ' + esc(vendor.scanned_at || '—') + '</p></div>' + '<div class="card"><h2>Domain scan checks</h2>' + checkTable(data.checkResults || []) + '</div><div class="split"><div class="card"><h2>Active Risks</h2>' + riskTable(data.activeRisks || []) + '</div><div class="card"><h2>Recent Changes</h2>' + eventMiniTable(data.recentChanges || []) + '</div></div><div class="card"><h2>Waived Checks</h2>' + checkTable(data.waivedCheckResults || []) + '</div>'; } catch (error) { $('vendor-detail').innerHTML = renderError('Vendor failed to load', error.message); }
 }
 function riskTable(rows, includeAction) { if (!rows.length) return '<p class="muted">No risk rows available.</p>'; return '<table><thead><tr><th>Risk/finding</th><th>Severity</th><th>Category</th><th>Type/subtype</th><th>Vendors</th><th>Domains</th>' + (includeAction ? '<th>Recommended action</th>' : '') + '</tr></thead><tbody>' + rows.map(r => '<tr><td>' + esc(r.title || r.finding || 'Untitled') + '</td><td>' + badge(r.severity_name || r.severity) + '</td><td>' + esc(r.category || 'Uncategorized') + '</td><td>' + esc([r.risk_type, r.risk_subtype].filter(Boolean).join(' / ') || 'Unknown') + '</td><td>' + esc(r.affected_vendor_count ?? 0) + '</td><td>' + esc(r.affected_domain_count ?? 0) + '</td>' + (includeAction ? '<td>' + esc(r.recommended_action || 'Review and remediate.') + '</td>' : '') + '</tr>').join('') + '</tbody></table>'; }
 function eventMiniTable(rows) { if (!rows.length) return '<p class="muted">No recent changes.</p>'; return '<table><thead><tr><th>Event</th><th>Risk</th><th>Severity</th><th>Captured</th></tr></thead><tbody>' + rows.map(e => '<tr><td>' + esc(e.event_type || 'changed') + '</td><td>' + esc(e.title || e.finding || 'Untitled') + '</td><td>' + badge(e.severity_name || e.severity) + '</td><td>' + esc(e.captured_at || '—') + '</td></tr>').join('') + '</tbody></table>'; }
@@ -1551,7 +1578,8 @@ function keyValueTable(obj) { const rows = Object.entries(obj || {}); return row
 function metric(label, value) { return '<div class="card"><div class="muted">' + esc(label) + '</div><div class="metric">' + esc(value ?? 0) + '</div></div>'; }
 function list(rows, key) { return rows && rows.length ? '<table><tbody>' + rows.map(row => '<tr><td>' + esc(row[key] || 'Unknown') + '</td><td>' + esc(row.count) + '</td></tr>').join('') + '</tbody></table>' : '<p class="muted">No failed active checks are available.</p>'; }
 function emptyCard() { return '<div class="card empty"><h2>No ingested data yet</h2><p>' + EMPTY_MESSAGE + '</p></div>'; }
-function errorCard(key) { const error = state.errors[key]; return error ? '<div class="card error-card"><h2>' + esc(error.label) + ' failed to load</h2><p>' + esc(error.message) + '</p></div>' : ''; }
+function errorCard(key) { const error = state.errors[key]; return error ? renderError(error.label + ' failed to load', error.message) : ''; }
+function bindVendorLinks() { document.querySelectorAll('[data-hostname]').forEach(btn => { btn.addEventListener('click', () => showVendor(btn.dataset.hostname)); }); }
 function show(view) { document.querySelectorAll('.view').forEach(el => el.classList.add('hidden')); $(view).classList.remove('hidden'); document.querySelectorAll('[data-view]').forEach(btn => btn.classList.toggle('active', btn.dataset.view === view)); }
 async function runChunked(path, label) {
   const log = $('ingest-log');
@@ -1561,16 +1589,16 @@ async function runChunked(path, label) {
   for (;;) {
     const sep = path.includes('?') ? '&' : '?';
     const url = path + sep + 'limit=5&batchSize=2&offset=' + offset;
-    log.textContent = label + ': running chunk offset ' + offset + ' (limit=5, batchSize=2)…\n' + log.textContent;
+    log.textContent = label + ': running chunk offset ' + offset + ' (limit=5, batchSize=2)…\\n' + log.textContent;
     const result = await api(url, { method: 'POST' }, 120000);
     totalSuccess += result.successCount || 0;
     totalFailures += result.failureCount || 0;
-    log.textContent = label + ': finished chunk offset ' + offset + ', processed=' + (result.vendorsProcessed ?? result.selectedVendorCount ?? 0) + ', successes=' + totalSuccess + ', failures=' + totalFailures + '\n' + JSON.stringify(result, null, 2);
+    log.textContent = label + ': finished chunk offset ' + offset + ', processed=' + (result.vendorsProcessed ?? result.selectedVendorCount ?? 0) + ', successes=' + totalSuccess + ', failures=' + totalFailures + '\\n' + JSON.stringify(result, null, 2);
     if (result.hasMore === false || (result.selectedVendorCount || 0) < 5) break;
     offset += 5;
     await new Promise(resolve => setTimeout(resolve, 50));
   }
-  log.textContent = label + ': complete. Refreshing dashboard from D1…\n' + log.textContent;
+  log.textContent = label + ': complete. Refreshing dashboard from D1…\\n' + log.textContent;
   await load();
 }
 document.querySelectorAll('[data-view]').forEach(btn => btn.addEventListener('click', () => show(btn.dataset.view)));
