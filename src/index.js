@@ -100,36 +100,45 @@ const LEGACY_D1_TABLES = ["vendors", "check_results", "waived_check_results"];
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    const pathname = url.pathname.replace(/\/+$/, "") || "/";
 
     if (request.method === "OPTIONS") return optionsResponse();
-    if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/vendor")) return html(renderDashboardShell());
+    if (request.method === "GET" && (pathname === "/" || pathname === "/vendor")) return html(renderDashboardShell());
 
     try {
-      if (request.method === "GET" && url.pathname === "/api/health") {
+      if (request.method === "GET" && pathname === "/api/health") {
         assertDb(env);
         return json({ ok: true, portfolioName: PORTFOLIO_NAME, vendorCount: PORTFOLIO_VENDORS.length, generatedAt: new Date().toISOString() });
       }
 
-      if (request.method === "GET" && url.pathname === "/api/debug/db") return json(await getDebugDb(env));
-      if (request.method === "GET" && url.pathname === "/api/debug/config") return json(getDebugConfig(env));
-      if (request.method === "GET" && url.pathname === "/api/debug/secret") return json(getDebugSecret(env));
-      if (request.method === "GET" && (url.pathname === "/api/debug/upguard-domain" || url.pathname === "/api/debug/upguard")) return json(await getDebugUpGuardDomain(env, url));
+      if (request.method === "GET" && pathname === "/api/debug/db") return json(await getDebugDb(env));
+      if (request.method === "GET" && pathname === "/api/debug/config") return json(getDebugConfig(env));
+      if (request.method === "GET" && pathname === "/api/debug/secret") return json(getDebugSecret(env));
+      if (request.method === "GET" && (pathname === "/api/debug/upguard-domain" || pathname === "/api/debug/upguard")) return json(await getDebugUpGuardDomain(env, url));
 
-      if (request.method === "POST" && url.pathname === "/api/ingest") {
-        const options = getIngestionOptions(url);
+      if (request.method === "POST" && pathname === "/api/ingest") {
+        const options = getIngestionOptions(url, { defaultLimit: 5, defaultBatchSize: 2 });
         const result = await runIngestion(env, { trigger: "api", ...options });
         return json(result, result.failureCount > 0 ? 207 : 200);
       }
 
-      if (request.method === "GET" && url.pathname === "/api/vendors") return json(await listVendors(env));
+      if (request.method === "POST" && pathname === "/api/ingest/chunk") {
+        const options = getIngestionOptions(url, { defaultLimit: 5, defaultBatchSize: 2 });
+        const result = await runIngestion(env, { trigger: "api_chunk", ...options });
+        return json(result, result.failureCount > 0 ? 207 : 200);
+      }
 
-      const vendorMatch = url.pathname.match(/^\/api\/vendor\/([^/]+)$/);
+      if (request.method === "GET" && pathname === "/api/ingest/status") return json(await getIngestionStatus(env));
+
+      if (request.method === "GET" && pathname === "/api/vendors") return json(await listVendors(env));
+
+      const vendorMatch = pathname.match(/^\/api\/vendor\/([^/]+)$/);
       if (request.method === "GET" && vendorMatch) return json(await getVendorDetail(env, decodeURIComponent(vendorMatch[1])));
 
-      if (request.method === "GET" && url.pathname === "/api/dashboard/overview") return json(await getDashboardOverview(env));
-      if (request.method === "GET" && url.pathname === "/api/dashboard/common-risks") return json(await getCommonRisks(env));
-      if (request.method === "GET" && url.pathname === "/api/dashboard/severity-breakdown") return json(await getSeverityBreakdown(env));
-      if (request.method === "GET" && url.pathname === "/api/dashboard/categories") return json(await getCategories(env));
+      if (request.method === "GET" && pathname === "/api/dashboard/overview") return json(await getDashboardOverview(env));
+      if (request.method === "GET" && pathname === "/api/dashboard/common-risks") return json(await getCommonRisks(env));
+      if (request.method === "GET" && pathname === "/api/dashboard/severity-breakdown") return json(await getSeverityBreakdown(env));
+      if (request.method === "GET" && pathname === "/api/dashboard/categories") return json(await getCategories(env));
     } catch (error) {
       if (error instanceof SchemaNotInitializedError) return json(error.toResponseBody(), 503);
       return json({ error: "worker_error", message: getErrorMessage(error) }, 500);
@@ -193,17 +202,24 @@ async function runIngestion(env, { trigger = "manual", batchSize = DEFAULT_BATCH
   };
 }
 
-function getIngestionOptions(url) {
+function getIngestionOptions(url, { defaultLimit = PORTFOLIO_VENDORS.length, defaultBatchSize = DEFAULT_BATCH_SIZE } = {}) {
+  const hasQueryParameters = Array.from(url.searchParams.keys()).length > 0;
   const hostname = normalizeHostname(url.searchParams.get("hostname"));
   const batchSize = url.searchParams.has("batchSize")
     ? clamp(url.searchParams.get("batchSize"), 1, MAX_BATCH_SIZE)
-    : DEFAULT_BATCH_SIZE;
+    : hasQueryParameters
+      ? DEFAULT_BATCH_SIZE
+      : clamp(defaultBatchSize, 1, MAX_BATCH_SIZE);
 
   if (hostname) return { vendors: [hostname], batchSize };
 
   const offset = url.searchParams.has("offset") ? clamp(url.searchParams.get("offset"), 0, PORTFOLIO_VENDORS.length) : 0;
   const availableVendors = PORTFOLIO_VENDORS.slice(offset);
-  const limit = url.searchParams.has("limit") ? clamp(url.searchParams.get("limit"), 0, availableVendors.length) : availableVendors.length;
+  const limit = url.searchParams.has("limit")
+    ? clamp(url.searchParams.get("limit"), 0, availableVendors.length)
+    : hasQueryParameters
+      ? availableVendors.length
+      : clamp(defaultLimit, 0, availableVendors.length);
 
   return { vendors: availableVendors.slice(0, limit), batchSize };
 }
@@ -244,6 +260,39 @@ async function getDebugUpGuardDomain(env, url) {
 
   if (!response.ok) result.errorBody = body.slice(0, 2000);
   return result;
+}
+
+async function getIngestionStatus(env) {
+  assertDb(env);
+  await assertD1Schema(env, ["ingestion_runs", "ingestion_errors"]);
+
+  const latestRun = await env.DB.prepare(
+    `SELECT id, started_at, completed_at, vendor_count, success_count, failure_count, status, error_json
+     FROM ingestion_runs
+     ORDER BY id DESC
+     LIMIT 1`
+  ).first();
+  const recentRuns = await env.DB.prepare(
+    `SELECT id, started_at, completed_at, vendor_count, success_count, failure_count, status
+     FROM ingestion_runs
+     ORDER BY id DESC
+     LIMIT 10`
+  ).all();
+  const recentErrors = await env.DB.prepare(
+    `SELECT id, hostname, error_message, status_code, created_at
+     FROM ingestion_errors
+     ORDER BY id DESC
+     LIMIT 10`
+  ).all();
+
+  return {
+    portfolioName: PORTFOLIO_NAME,
+    vendorCount: PORTFOLIO_VENDORS.length,
+    latestRun: latestRun ? { ...latestRun, errors: parseJson(latestRun.error_json, []) } : null,
+    recentRuns: recentRuns.results || [],
+    recentErrors: recentErrors.results || [],
+    generatedAt: new Date().toISOString(),
+  };
 }
 
 async function ingestVendor(env, vendorPrimaryHostname, hostname) {
