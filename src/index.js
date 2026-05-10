@@ -88,7 +88,7 @@ const PORTFOLIO_VENDORS = [
 const UPGUARD_DOMAIN_ENDPOINT = "https://cyber-risk.upguard.com/api/public/vendor/domain";
 const UPGUARD_PORTFOLIO_RISK_PROFILE_ENDPOINT = "https://cyber-risk.upguard.com/api/public/risks/vendors/all";
 const UPGUARD_VENDOR_RISKS_ENDPOINT = "https://cyber-risk.upguard.com/api/public/risks/vendors";
-const UPGUARD_RISK_DIFF_ENDPOINT = "https://cyber-risk.upguard.com/api/public/risk/vendors/diff";
+const UPGUARD_RISK_DIFF_ENDPOINT = "https://cyber-risk.upguard.com/api/public/risks/vendors/diff";
 const DEFAULT_BATCH_SIZE = 6;
 const MAX_BATCH_SIZE = 10;
 const CURRENT_D1_TABLES = [
@@ -1024,6 +1024,7 @@ async function getDebugUpGuardRiskDiff(env, url) {
   const summary = await summarizeRiskDiffDebugResponse(response);
   return {
     requestedVendorPrimaryHostname,
+    upstreamEndpoint: upstreamUrl.origin + upstreamUrl.pathname,
     upstreamParams: {
       vendor_primary_hostname: requestedVendorPrimaryHostname,
       start_date: range.startDate,
