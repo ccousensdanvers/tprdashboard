@@ -101,6 +101,10 @@ const CURRENT_D1_TABLES = [
   "portfolio_common_risks",
   "vendor_active_risks",
   "vendor_risk_events",
+  "domain_score_snapshots",
+  "domain_risk_count_snapshots",
+  "category_snapshots",
+  "risk_findings_history",
 ];
 const LEGACY_D1_TABLES = ["vendors", "check_results", "waived_check_results"];
 
@@ -178,6 +182,13 @@ export default {
       if (request.method === "GET" && pathname === "/api/dashboard/common-risks") return json(await getCommonRisks(env));
       if (request.method === "GET" && pathname === "/api/dashboard/severity-breakdown") return json(await getSeverityBreakdown(env));
       if (request.method === "GET" && pathname === "/api/dashboard/categories") return json(await getCategories(env));
+      if (request.method === "GET" && pathname === "/api/trends/score") return json(await getTrendScore(env, url));
+      if (request.method === "GET" && pathname === "/api/trends/severity") return json(await getTrendSeverity(env, url));
+      if (request.method === "GET" && pathname === "/api/trends/categories") return json(await getTrendCategories(env, url));
+      if (request.method === "GET" && pathname === "/api/trends/vendor-movers") return json(await getTrendVendorMovers(env, url));
+      if (request.method === "GET" && pathname === "/api/trends/risk-events") return json(await getTrendRiskEvents(env, url));
+      if (request.method === "GET" && pathname === "/api/trends/risk-aging") return json(await getTrendRiskAging(env));
+      if (request.method === "GET" && pathname === "/api/trends/ingestion-health") return json(await getTrendIngestionHealth(env, url));
     } catch (error) {
       if (error instanceof SchemaNotInitializedError) return json(error.toResponseBody(), 503);
       return json({ error: "worker_error", message: getErrorMessage(error) }, 500);
@@ -712,7 +723,6 @@ function normalizeCheckResults(vendorPrimaryHostname, hostname, checkResults) {
 }
 
 async function persistVendorDomain(db, vendor) {
-  // TODO(snapshot-history): write immutable vendor/check snapshots before replacement for longitudinal trends, change feeds, and executive reporting.
   await db.batch([
     db.prepare(
       `INSERT INTO vendor_domains (
@@ -736,6 +746,120 @@ async function persistVendorDomain(db, vendor) {
   ];
 
   for (const batch of chunk(statements, 50)) {
+    if (batch.length) await db.batch(batch);
+  }
+
+  await persistDomainTrendSnapshots(db, vendor);
+}
+
+async function persistDomainTrendSnapshots(db, vendor) {
+  const now = new Date().toISOString();
+  const activeChecks = vendor.checkResults || [];
+  const failedChecks = activeChecks.filter((check) => check.passed === 0);
+  const waivedChecks = vendor.waivedCheckResults || [];
+  const severityCounts = failedChecks.reduce((counts, check) => {
+    const severity = String(check.severityName || "").trim().toLowerCase();
+    if (["critical", "high", "medium", "low"].includes(severity)) counts[severity] += 1;
+    return counts;
+  }, { critical: 0, high: 0, medium: 0, low: 0 });
+
+  await db.batch([
+    db.prepare(
+      `INSERT INTO domain_score_snapshots (vendor_primary_hostname, hostname, automated_score, scanned_at, captured_at)
+       VALUES (?, ?, ?, ?, ?)`
+    ).bind(vendor.vendorPrimaryHostname, vendor.hostname, vendor.automatedScore, vendor.scannedAt, now),
+    db.prepare(
+      `INSERT INTO domain_risk_count_snapshots (
+         vendor_primary_hostname, hostname, critical_count, high_count, medium_count, low_count,
+         failed_check_count, waived_check_count, total_check_count, captured_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      vendor.vendorPrimaryHostname,
+      vendor.hostname,
+      severityCounts.critical,
+      severityCounts.high,
+      severityCounts.medium,
+      severityCounts.low,
+      failedChecks.length,
+      waivedChecks.length,
+      activeChecks.length,
+      now
+    ),
+  ]);
+
+  const categories = new Map();
+  for (const check of failedChecks) {
+    const category = check.category || "Uncategorized";
+    const entry = categories.get(category) || { failedCheckCount: 0, vendors: new Set() };
+    entry.failedCheckCount += 1;
+    entry.vendors.add(vendor.vendorPrimaryHostname);
+    categories.set(category, entry);
+  }
+  for (const batch of chunk(Array.from(categories.entries()).map(([category, entry]) => db.prepare(
+    `INSERT INTO category_snapshots (category, failed_check_count, affected_vendor_count, captured_at)
+     VALUES (?, ?, ?, ?)`
+  ).bind(category, entry.failedCheckCount, entry.vendors.size, now)), 50)) {
+    if (batch.length) await db.batch(batch);
+  }
+
+  const seenKeys = [];
+  for (const batch of chunk(failedChecks.map((check) => {
+    const findingKey = buildFindingKey(vendor.vendorPrimaryHostname, vendor.hostname, check);
+    seenKeys.push(findingKey);
+    return db.prepare(
+      `INSERT INTO risk_findings_history (
+         finding_key, vendor_primary_hostname, hostname, check_id, title, category, risk_type, risk_subtype,
+         severity, severity_name, first_seen_at, last_seen_at, resolved_at, status, raw_json
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'open', ?)
+       ON CONFLICT(finding_key) DO UPDATE SET
+         check_id = excluded.check_id,
+         title = excluded.title,
+         category = excluded.category,
+         risk_type = excluded.risk_type,
+         risk_subtype = excluded.risk_subtype,
+         severity = excluded.severity,
+         severity_name = excluded.severity_name,
+         last_seen_at = excluded.last_seen_at,
+         resolved_at = NULL,
+         status = 'open',
+         raw_json = excluded.raw_json`
+    ).bind(
+      findingKey,
+      vendor.vendorPrimaryHostname,
+      vendor.hostname,
+      check.checkId,
+      check.title,
+      check.category,
+      check.riskType,
+      check.riskSubtype,
+      check.severity,
+      check.severityName,
+      now,
+      now,
+      check.rawJson
+    );
+  }), 50)) {
+    if (batch.length) await db.batch(batch);
+  }
+
+  await markResolvedFindings(db, vendor.vendorPrimaryHostname, vendor.hostname, seenKeys, now);
+}
+
+function buildFindingKey(vendorPrimaryHostname, hostname, check) {
+  if (check.checkId) return [vendorPrimaryHostname, hostname, check.checkId].join("|");
+  return [vendorPrimaryHostname, hostname, check.title, check.category, check.riskType, check.riskSubtype].map((value) => value || "").join("|");
+}
+
+async function markResolvedFindings(db, vendorPrimaryHostname, hostname, seenKeys, resolvedAt) {
+  const open = await db.prepare(
+    `SELECT finding_key FROM risk_findings_history
+     WHERE vendor_primary_hostname = ? AND hostname = ? AND status = 'open'`
+  ).bind(vendorPrimaryHostname, hostname).all();
+  const seen = new Set(seenKeys);
+  const resolvedKeys = (open.results || []).map((row) => row.finding_key).filter((key) => !seen.has(key));
+  for (const batch of chunk(resolvedKeys.map((findingKey) => db.prepare(
+    `UPDATE risk_findings_history SET status = 'resolved', resolved_at = ? WHERE finding_key = ?`
+  ).bind(resolvedAt, findingKey)), 50)) {
     if (batch.length) await db.batch(batch);
   }
 }
@@ -969,6 +1093,195 @@ async function getCategories(env) {
      ORDER BY count DESC, category ASC`
   ).all();
   return { portfolioName: PORTFOLIO_NAME, categories: results || [] };
+}
+
+function getTrendDays(url, defaultDays, maxDays = 365) {
+  return clamp(url.searchParams.get("days") || defaultDays, 1, maxDays);
+}
+
+async function getTrendScore(env, url) {
+  assertDb(env);
+  await assertD1Schema(env, ["domain_score_snapshots"]);
+  const days = getTrendDays(url, 90);
+  const { results } = await env.DB.prepare(
+    `SELECT date(captured_at) AS date,
+            ROUND(AVG(automated_score), 2) AS average_score,
+            MIN(automated_score) AS min_score,
+            MAX(automated_score) AS max_score,
+            COUNT(DISTINCT vendor_primary_hostname) AS vendor_count
+     FROM domain_score_snapshots
+     WHERE captured_at >= datetime('now', ?)
+       AND automated_score IS NOT NULL
+     GROUP BY date(captured_at)
+     ORDER BY date ASC`
+  ).bind(`-${days} days`).all();
+  return results || [];
+}
+
+async function getTrendSeverity(env, url) {
+  assertDb(env);
+  await assertD1Schema(env, ["domain_risk_count_snapshots"]);
+  const days = getTrendDays(url, 90);
+  const { results } = await env.DB.prepare(
+    `SELECT date(captured_at) AS date,
+            COALESCE(SUM(critical_count), 0) AS critical_count,
+            COALESCE(SUM(high_count), 0) AS high_count,
+            COALESCE(SUM(medium_count), 0) AS medium_count,
+            COALESCE(SUM(low_count), 0) AS low_count,
+            COALESCE(SUM(failed_check_count), 0) AS failed_check_count
+     FROM domain_risk_count_snapshots
+     WHERE captured_at >= datetime('now', ?)
+     GROUP BY date(captured_at)
+     ORDER BY date ASC`
+  ).bind(`-${days} days`).all();
+  return results || [];
+}
+
+async function getTrendCategories(env, url) {
+  assertDb(env);
+  await assertD1Schema(env, ["category_snapshots"]);
+  const days = getTrendDays(url, 90);
+  const { results } = await env.DB.prepare(
+    `WITH top_categories AS (
+       SELECT category
+       FROM category_snapshots
+       WHERE captured_at >= datetime('now', ?)
+       GROUP BY category
+       ORDER BY SUM(failed_check_count) DESC, category ASC
+       LIMIT 8
+     )
+     SELECT date(captured_at) AS date,
+            category,
+            COALESCE(SUM(failed_check_count), 0) AS failed_check_count,
+            COALESCE(SUM(affected_vendor_count), 0) AS affected_vendor_count
+     FROM category_snapshots
+     WHERE captured_at >= datetime('now', ?)
+       AND category IN (SELECT category FROM top_categories)
+     GROUP BY date(captured_at), category
+     ORDER BY date ASC, failed_check_count DESC, category ASC`
+  ).bind(`-${days} days`, `-${days} days`).all();
+  return results || [];
+}
+
+async function getTrendVendorMovers(env, url) {
+  assertDb(env);
+  await assertD1Schema(env, ["domain_score_snapshots"]);
+  const days = getTrendDays(url, 30);
+  const { results } = await env.DB.prepare(
+    `WITH ranged AS (
+       SELECT vendor_primary_hostname, hostname, automated_score, captured_at
+       FROM domain_score_snapshots
+       WHERE captured_at >= datetime('now', ?)
+         AND automated_score IS NOT NULL
+     ), starts AS (
+       SELECT r.vendor_primary_hostname, r.hostname, r.automated_score AS start_score
+       FROM ranged r
+       JOIN (
+         SELECT vendor_primary_hostname, hostname, MIN(captured_at) AS captured_at
+         FROM ranged
+         GROUP BY vendor_primary_hostname, hostname
+       ) m ON m.vendor_primary_hostname = r.vendor_primary_hostname AND m.hostname = r.hostname AND m.captured_at = r.captured_at
+     ), ends AS (
+       SELECT r.vendor_primary_hostname, r.hostname, r.automated_score AS end_score
+       FROM ranged r
+       JOIN (
+         SELECT vendor_primary_hostname, hostname, MAX(captured_at) AS captured_at
+         FROM ranged
+         GROUP BY vendor_primary_hostname, hostname
+       ) m ON m.vendor_primary_hostname = r.vendor_primary_hostname AND m.hostname = r.hostname AND m.captured_at = r.captured_at
+     )
+     SELECT e.hostname, s.start_score, e.end_score, e.end_score - s.start_score AS delta
+     FROM ends e
+     JOIN starts s ON s.vendor_primary_hostname = e.vendor_primary_hostname AND s.hostname = e.hostname
+     WHERE e.end_score != s.start_score
+     ORDER BY ABS(e.end_score - s.start_score) DESC, e.hostname ASC`
+  ).bind(`-${days} days`).all();
+  const rows = results || [];
+  return {
+    improved: rows.filter((row) => row.delta > 0).sort((a, b) => b.delta - a.delta).slice(0, 10),
+    declined: rows.filter((row) => row.delta < 0).sort((a, b) => a.delta - b.delta).slice(0, 10),
+  };
+}
+
+async function getTrendRiskEvents(env, url) {
+  assertDb(env);
+  await assertD1Schema(env, ["vendor_risk_events"]);
+  const days = getTrendDays(url, 30);
+  const { results } = await env.DB.prepare(
+    `SELECT date(COALESCE(event_start, captured_at)) AS date,
+            COALESCE(SUM(CASE WHEN LOWER(COALESCE(event_type, '')) IN ('introduced', 'new') THEN 1 ELSE 0 END), 0) AS introduced,
+            COALESCE(SUM(CASE WHEN LOWER(COALESCE(event_type, '')) = 'resolved' THEN 1 ELSE 0 END), 0) AS resolved,
+            COALESCE(SUM(CASE WHEN LOWER(COALESCE(event_type, '')) IN ('introduced', 'new') THEN 1 WHEN LOWER(COALESCE(event_type, '')) = 'resolved' THEN -1 ELSE 0 END), 0) AS net
+     FROM vendor_risk_events
+     WHERE COALESCE(event_start, captured_at) >= datetime('now', ?)
+     GROUP BY date(COALESCE(event_start, captured_at))
+     ORDER BY date ASC`
+  ).bind(`-${days} days`).all();
+  return results || [];
+}
+
+async function getTrendRiskAging(env) {
+  assertDb(env);
+  await assertD1Schema(env, ["risk_findings_history"]);
+  const { results } = await env.DB.prepare(
+    `SELECT CASE
+              WHEN julianday('now') - julianday(first_seen_at) <= 7 THEN '0-7 days'
+              WHEN julianday('now') - julianday(first_seen_at) <= 30 THEN '8-30 days'
+              WHEN julianday('now') - julianday(first_seen_at) <= 90 THEN '31-90 days'
+              ELSE '90+ days'
+            END AS bucket,
+            COALESCE(SUM(CASE WHEN LOWER(COALESCE(severity_name, '')) = 'critical' THEN 1 ELSE 0 END), 0) AS critical,
+            COALESCE(SUM(CASE WHEN LOWER(COALESCE(severity_name, '')) = 'high' THEN 1 ELSE 0 END), 0) AS high,
+            COALESCE(SUM(CASE WHEN LOWER(COALESCE(severity_name, '')) = 'medium' THEN 1 ELSE 0 END), 0) AS medium,
+            COALESCE(SUM(CASE WHEN LOWER(COALESCE(severity_name, '')) = 'low' THEN 1 ELSE 0 END), 0) AS low,
+            COUNT(*) AS total
+     FROM risk_findings_history
+     WHERE status = 'open'
+     GROUP BY bucket`
+  ).all();
+  const defaults = ["0-7 days", "8-30 days", "31-90 days", "90+ days"].map((bucket) => ({ bucket, critical: 0, high: 0, medium: 0, low: 0, total: 0 }));
+  const byBucket = new Map(defaults.map((row) => [row.bucket, row]));
+  for (const row of results || []) byBucket.set(row.bucket, { ...byBucket.get(row.bucket), ...row });
+  return { buckets: defaults.map((row) => byBucket.get(row.bucket)) };
+}
+
+async function getTrendIngestionHealth(env, url) {
+  assertDb(env);
+  await assertD1Schema(env, ["ingestion_runs", "ingestion_errors"]);
+  const days = getTrendDays(url, 30);
+  const runs = await env.DB.prepare(
+    `SELECT date(started_at) AS date,
+            COUNT(*) AS run_count,
+            COALESCE(SUM(COALESCE(success_count, 0)), 0) AS success_count,
+            COALESCE(SUM(COALESCE(failure_count, 0)), 0) AS failure_count,
+            COALESCE(SUM(CASE WHEN status IN ('completed', 'success') THEN 1 ELSE 0 END), 0) AS successful_run_count,
+            COALESCE(SUM(CASE WHEN status NOT IN ('completed', 'success') OR status IS NULL THEN 1 ELSE 0 END), 0) AS failed_run_count,
+            ROUND(AVG(CASE WHEN started_at IS NOT NULL AND completed_at IS NOT NULL THEN (julianday(completed_at) - julianday(started_at)) * 86400000 ELSE NULL END), 0) AS average_elapsed_ms
+     FROM ingestion_runs
+     WHERE started_at >= datetime('now', ?)
+     GROUP BY date(started_at)
+     ORDER BY date ASC`
+  ).bind(`-${days} days`).all();
+  const errorsByStatusCode = await env.DB.prepare(
+    `SELECT COALESCE(CAST(status_code AS TEXT), 'unknown') AS status_code, COUNT(*) AS count
+     FROM ingestion_errors
+     WHERE created_at >= datetime('now', ?)
+     GROUP BY COALESCE(CAST(status_code AS TEXT), 'unknown')
+     ORDER BY count DESC, status_code ASC`
+  ).bind(`-${days} days`).all();
+  const topFailingHostnames = await env.DB.prepare(
+    `SELECT COALESCE(hostname, 'unknown') AS hostname, COUNT(*) AS count
+     FROM ingestion_errors
+     WHERE created_at >= datetime('now', ?)
+     GROUP BY COALESCE(hostname, 'unknown')
+     ORDER BY count DESC, hostname ASC
+     LIMIT 10`
+  ).bind(`-${days} days`).all();
+  return {
+    runsByDay: runs.results || [],
+    errorsByStatusCode: errorsByStatusCode.results || [],
+    topFailingHostnames: topFailingHostnames.results || [],
+  };
 }
 
 async function getLatestPortfolioRiskProfile(env) {
@@ -1594,6 +1907,11 @@ function renderDashboardShell() {
     .badge { display: inline-flex; border-radius: 999px; padding: 4px 9px; font-size: 12px; font-weight: 800; background: #26364f; color: #dbeafe; }
     .critical { background: #7f1d1d; color: #fee2e2; } .high { background: #9a3412; color: #ffedd5; } .medium { background: #854d0e; color: #fef3c7; } .low { background: #14532d; color: #dcfce7; } .pass { background: #1e3a8a; color: #dbeafe; }
     .split { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .chart { width: 100%; min-height: 220px; overflow: hidden; }
+    .chart svg { width: 100%; height: 220px; display: block; }
+    .legend { display: flex; flex-wrap: wrap; gap: 8px 14px; margin: 8px 0 14px; }
+    .legend span { display: inline-flex; align-items: center; gap: 6px; color: #cbd5e1; font-size: 13px; }
+    .swatch { width: 10px; height: 10px; border-radius: 999px; display: inline-block; }
     .muted { color: #94a3b8; } .link { color: #93c5fd; cursor: pointer; font-weight: 800; }
     .vendor-link { appearance: none; background: transparent; border: 0; border-radius: 0; padding: 0; color: #93c5fd; } .vendor-link:hover { background: transparent; color: #bfdbfe; text-decoration: underline; }
     .hidden { display: none; }
@@ -1612,6 +1930,7 @@ function renderDashboardShell() {
       <button data-view="changes">Changes Feed</button>
       <button data-view="campaigns">Remediation Campaigns</button>
       <button data-view="severity">Severity Breakdown</button>
+      <button data-view="trends">Trends</button>
     </div>
   </header>
   <main>
@@ -1623,11 +1942,12 @@ function renderDashboardShell() {
     <section id="changes" class="view hidden"></section>
     <section id="campaigns" class="view hidden"></section>
     <section id="severity" class="view hidden"></section>
+    <section id="trends" class="view hidden"></section>
     <section id="vendor-detail" class="view hidden"></section>
   </main>
 <script>
 const EMPTY_MESSAGE = 'No cached risk data found. Run manual ingestion to populate the dashboard.';
-const state = { overview: null, vendors: [], risks: [], severities: [], categories: [], changes: [], campaigns: [], ingestStatus: null, errors: {}, endpointDiagnostics: [] };
+const state = { overview: null, vendors: [], risks: [], severities: [], categories: [], changes: [], campaigns: [], trends: {}, ingestStatus: null, errors: {}, endpointDiagnostics: [] };
 const $ = id => document.getElementById(id);
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
   "&": "&amp;",
@@ -1682,6 +2002,7 @@ async function load() {
   state.categories = [];
   state.changes = [];
   state.campaigns = [];
+  state.trends = {};
   state.ingestStatus = null;
   const endpoints = [
     ['overview', '/api/dashboard/overview', d => state.overview = d, d => Boolean(d && (Number(d.totalDomains || 0) || Number(d.totalVendors || 0) || d.hasCachedData))],
@@ -1691,7 +2012,14 @@ async function load() {
     ['categories', '/api/dashboard/categories', d => state.categories = Array.isArray(d.categories) ? d.categories : [], d => Boolean(d && Array.isArray(d.categories) && d.categories.length)],
     ['ingestStatus', '/api/ingest/status', d => state.ingestStatus = d, d => Boolean(d && (d.hasCachedData || d.latestRun || d.latestRuns || d.lastIngestionTimestamps))],
     ['changes', '/api/dashboard/changes', d => state.changes = Array.isArray(d.changes) ? d.changes : (Array.isArray(d.events) ? d.events : []), d => Boolean(d && ((Array.isArray(d.changes) && d.changes.length) || (Array.isArray(d.events) && d.events.length)))],
-    ['campaigns', '/api/dashboard/remediation-campaigns', d => state.campaigns = Array.isArray(d.campaigns) ? d.campaigns : [], d => Boolean(d && Array.isArray(d.campaigns) && d.campaigns.length)]
+    ['campaigns', '/api/dashboard/remediation-campaigns', d => state.campaigns = Array.isArray(d.campaigns) ? d.campaigns : [], d => Boolean(d && Array.isArray(d.campaigns) && d.campaigns.length)],
+    ['trendScore', '/api/trends/score?days=90', d => state.trends.score = Array.isArray(d) ? d : [], d => Array.isArray(d) && d.length],
+    ['trendSeverity', '/api/trends/severity?days=90', d => state.trends.severity = Array.isArray(d) ? d : [], d => Array.isArray(d) && d.length],
+    ['trendCategories', '/api/trends/categories?days=90', d => state.trends.categories = Array.isArray(d) ? d : [], d => Array.isArray(d) && d.length],
+    ['trendMovers', '/api/trends/vendor-movers?days=30', d => state.trends.movers = d || { improved: [], declined: [] }, d => Boolean(d && ((d.improved || []).length || (d.declined || []).length))],
+    ['trendEvents', '/api/trends/risk-events?days=30', d => state.trends.events = Array.isArray(d) ? d : [], d => Array.isArray(d) && d.length],
+    ['trendAging', '/api/trends/risk-aging', d => state.trends.aging = d || { buckets: [] }, d => Boolean(d && Array.isArray(d.buckets) && d.buckets.some(b => Number(b.total || 0)))],
+    ['trendHealth', '/api/trends/ingestion-health?days=30', d => state.trends.health = d || {}, d => Boolean(d && ((d.runsByDay || []).length || (d.errorsByStatusCode || []).length || (d.topFailingHostnames || []).length))]
   ];
   const results = await Promise.allSettled(endpoints.map(([, path, assign, hasRows]) => api(path).then(data => {
     assign(data);
@@ -1709,14 +2037,14 @@ async function load() {
     state.errors[key] = { label: key, message };
   });
   if (!state.overview && (state.vendors || []).length) state.overview = fallbackOverviewFromVendors(state.vendors);
-  const failedRequiredEndpoints = state.endpointDiagnostics.filter(item => item.status === 'failed' && !['/api/dashboard/changes', '/api/dashboard/remediation-campaigns', '/api/ingest/status'].includes(item.path));
+  const failedRequiredEndpoints = state.endpointDiagnostics.filter(item => item.status === 'failed' && !['/api/dashboard/changes', '/api/dashboard/remediation-campaigns', '/api/ingest/status'].includes(item.path) && !item.path.startsWith('/api/trends/'));
   const failedEndpoints = state.endpointDiagnostics.filter(item => item.status === 'failed');
   const hasCachedData = Boolean((state.vendors || []).length || (state.overview && state.overview.hasCachedData) || (state.ingestStatus && state.ingestStatus.hasCachedData));
   const statusMessage = hasCachedData
     ? (failedEndpoints.length ? 'Loaded partial dashboard data. Some optional sections failed.' : 'Loaded cached D1 data.')
     : EMPTY_MESSAGE;
   $('status').innerHTML = '<p>' + esc(statusMessage) + '</p>' + (failedRequiredEndpoints.length ? '<p class="muted">One or more primary dashboard sections failed; loaded sections remain available.</p>' : '') + endpointDiagnostics();
-  renderOverview(); renderVendors(); renderRisks(); renderChanges(); renderCampaigns(); renderSeverity();
+  renderOverview(); renderVendors(); renderRisks(); renderChanges(); renderCampaigns(); renderSeverity(); renderTrends();
 }
 function fallbackOverviewFromVendors(vendors) {
   const scores = (vendors || []).map(v => Number(v.score ?? v.automated_score)).filter(Number.isFinite);
@@ -1753,6 +2081,70 @@ function renderCampaigns() {
   $('campaigns').innerHTML = '<div class="card"><h2>Remediation Campaigns</h2><table><thead><tr><th>Campaign</th><th>Risk count</th><th>Affected vendors</th><th>Affected domains</th><th>Max severity</th></tr></thead><tbody>' + body + '</tbody></table></div>';
 }
 function renderSeverity() { $('severity').innerHTML = errorCard('severities') + errorCard('categories') + '<div class="split"><div class="card"><h2>Severity Breakdown</h2>' + list(state.severities, 'severity_name') + '</div><div class="card"><h2>Category Grouping</h2>' + list(state.categories, 'category') + '</div></div>'; }
+
+function renderTrends() {
+  const t = state.trends || {};
+  const scoreDays = new Set((t.score || []).map(r => r.date));
+  const hasSnapshots = (t.score || []).length || (t.severity || []).length || (t.categories || []).length;
+  const snapshotMessage = !hasSnapshots
+    ? '<div class="card empty"><h2>No historical snapshots yet</h2><p>No historical snapshots yet. Run ingestion over multiple days to populate trend charts.</p></div>'
+    : scoreDays.size === 1
+      ? '<div class="card empty"><h2>Only one snapshot day</h2><p>Showing the current point. Directional trends require multiple ingestion runs on different days.</p></div>'
+      : '';
+  $('trends').innerHTML = errorCard('trendScore') + errorCard('trendSeverity') + errorCard('trendCategories') + errorCard('trendMovers') + errorCard('trendEvents') + errorCard('trendAging') + errorCard('trendHealth') + snapshotMessage +
+    '<div class="split"><div class="card"><h2>Portfolio average score over time</h2>' + lineChart(t.score || [], [{ key: 'average_score', label: 'Average score', color: '#60a5fa' }]) + '</div>' +
+    '<div class="card"><h2>Critical/high/medium/low findings over time</h2>' + lineChart(t.severity || [], [
+      { key: 'critical_count', label: 'Critical', color: '#f87171' },
+      { key: 'high_count', label: 'High', color: '#fb923c' },
+      { key: 'medium_count', label: 'Medium', color: '#facc15' },
+      { key: 'low_count', label: 'Low', color: '#4ade80' }
+    ]) + '</div></div>' +
+    '<div class="split"><div class="card"><h2>New vs resolved risk events</h2>' + lineChart(t.events || [], [
+      { key: 'introduced', label: 'Introduced', color: '#f87171' },
+      { key: 'resolved', label: 'Resolved', color: '#4ade80' },
+      { key: 'net', label: 'Net', color: '#93c5fd' }
+    ]) + '</div>' +
+    '<div class="card"><h2>Top risk categories over time</h2>' + categoryChart(t.categories || []) + categoryTrendTable(t.categories || []) + '</div></div>' +
+    '<div class="split"><div class="card"><h2>Vendor movers</h2>' + vendorMoversTable(t.movers || { improved: [], declined: [] }) + '</div>' +
+    '<div class="card"><h2>Risk aging buckets</h2>' + riskAgingTable((t.aging && t.aging.buckets) || []) + '</div></div>' +
+    '<div class="card"><h2>Ingestion health</h2>' + ingestionHealth(t.health || {}) + '</div>';
+}
+function lineChart(rows, series) {
+  if (!rows.length) return '<p class="muted">No trend data available yet.</p>';
+  const width = 640, height = 220, pad = 28;
+  const dates = rows.map(r => r.date || '');
+  const values = rows.flatMap(r => series.map(s => Number(r[s.key] || 0))).filter(Number.isFinite);
+  const max = Math.max(1, ...values), min = Math.min(0, ...values);
+  const x = i => pad + (dates.length === 1 ? (width - pad * 2) / 2 : i * (width - pad * 2) / (dates.length - 1));
+  const y = v => height - pad - ((Number(v || 0) - min) * (height - pad * 2) / (max - min || 1));
+  const lines = series.map(s => {
+    const pts = rows.map((r, i) => x(i).toFixed(1) + ',' + y(r[s.key]).toFixed(1)).join(' ');
+    const circles = rows.map((r, i) => '<circle cx="' + x(i).toFixed(1) + '" cy="' + y(r[s.key]).toFixed(1) + '" r="3" fill="' + s.color + '"><title>' + esc((r.date || '') + ' ' + s.label + ': ' + (r[s.key] ?? 0)) + '</title></circle>').join('');
+    return '<polyline points="' + pts + '" fill="none" stroke="' + s.color + '" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />' + circles;
+  }).join('');
+  const legend = '<div class="legend">' + series.map(s => '<span><i class="swatch" style="background:' + s.color + '"></i>' + esc(s.label) + '</span>').join('') + '</div>';
+  const label = dates.length ? '<text x="' + pad + '" y="214" fill="#94a3b8" font-size="11">' + esc(dates[0]) + '</text><text x="' + (width - pad) + '" y="214" fill="#94a3b8" font-size="11" text-anchor="end">' + esc(dates[dates.length - 1]) + '</text>' : '';
+  return legend + '<div class="chart"><svg viewBox="0 0 ' + width + ' ' + height + '" role="img"><line x1="' + pad + '" y1="' + (height - pad) + '" x2="' + (width - pad) + '" y2="' + (height - pad) + '" stroke="#334155" /><line x1="' + pad + '" y1="' + pad + '" x2="' + pad + '" y2="' + (height - pad) + '" stroke="#334155" />' + lines + label + '</svg></div>';
+}
+function categoryChart(rows) {
+  if (!rows.length) return '';
+  const dates = Array.from(new Set(rows.map(r => r.date))).sort();
+  const categories = Array.from(new Set(rows.map(r => r.category))).slice(0, 6);
+  const colors = ['#60a5fa', '#f87171', '#fb923c', '#facc15', '#4ade80', '#c084fc'];
+  const byKey = new Map(rows.map(r => [r.date + '|' + r.category, Number(r.failed_check_count || 0)]));
+  const chartRows = dates.map(date => {
+    const row = { date };
+    categories.forEach(category => row[category] = byKey.get(date + '|' + category) || 0);
+    return row;
+  });
+  return lineChart(chartRows, categories.map((category, index) => ({ key: category, label: category, color: colors[index % colors.length] })));
+}
+function categoryTrendTable(rows) { if (!rows.length) return '<p class="muted">No category snapshots yet.</p>'; return '<table><thead><tr><th>Date</th><th>Category</th><th>Failed checks</th><th>Affected vendors</th></tr></thead><tbody>' + rows.slice(-80).map(r => '<tr><td>' + esc(r.date) + '</td><td>' + esc(r.category) + '</td><td>' + esc(r.failed_check_count || 0) + '</td><td>' + esc(r.affected_vendor_count || 0) + '</td></tr>').join('') + '</tbody></table>'; }
+function vendorMoversTable(movers) { const rows = [ ...((movers.improved || []).map(r => ({ ...r, direction: 'Improved' }))), ...((movers.declined || []).map(r => ({ ...r, direction: 'Declined' }))) ]; if (!rows.length) return '<p class="muted">No vendor score changes in this range.</p>'; return '<table><thead><tr><th>Direction</th><th>Hostname</th><th>Start</th><th>End</th><th>Delta</th></tr></thead><tbody>' + rows.map(r => '<tr><td>' + esc(r.direction) + '</td><td>' + esc(r.hostname) + '</td><td>' + esc(r.start_score) + '</td><td>' + esc(r.end_score) + '</td><td>' + esc(r.delta) + '</td></tr>').join('') + '</tbody></table>'; }
+function riskAgingTable(rows) { if (!rows.length) return '<p class="muted">No open risk findings have been observed yet.</p>'; return '<table><thead><tr><th>Bucket</th><th>Critical</th><th>High</th><th>Medium</th><th>Low</th><th>Total</th></tr></thead><tbody>' + rows.map(r => '<tr><td>' + esc(r.bucket) + '</td><td>' + esc(r.critical || 0) + '</td><td>' + esc(r.high || 0) + '</td><td>' + esc(r.medium || 0) + '</td><td>' + esc(r.low || 0) + '</td><td>' + esc(r.total || 0) + '</td></tr>').join('') + '</tbody></table>'; }
+function ingestionHealth(health) { const runs = health.runsByDay || [], codes = health.errorsByStatusCode || [], hosts = health.topFailingHostnames || []; if (!runs.length && !codes.length && !hosts.length) return '<p class="muted">No ingestion health data is available yet.</p>'; return '<div class="split"><div><h2>Runs by day</h2>' + (runs.length ? '<table><thead><tr><th>Date</th><th>Runs</th><th>Vendor successes</th><th>Vendor failures</th><th>Avg ms</th></tr></thead><tbody>' + runs.map(r => '<tr><td>' + esc(r.date) + '</td><td>' + esc(r.run_count || 0) + '</td><td>' + esc(r.success_count || 0) + '</td><td>' + esc(r.failure_count || 0) + '</td><td>' + esc(r.average_elapsed_ms || '—') + '</td></tr>').join('') + '</tbody></table>' : '<p class="muted">No runs in range.</p>') + '</div><div><h2>Errors</h2>' + simpleCountTable(codes, 'status_code', 'Status code') + '<h2>Top failing hostnames</h2>' + simpleCountTable(hosts, 'hostname', 'Hostname') + '</div></div>'; }
+function simpleCountTable(rows, key, label) { return rows.length ? '<table><thead><tr><th>' + esc(label) + '</th><th>Count</th></tr></thead><tbody>' + rows.map(r => '<tr><td>' + esc(r[key]) + '</td><td>' + esc(r.count || 0) + '</td></tr>').join('') + '</tbody></table>' : '<p class="muted">No rows.</p>'; }
+
 async function showVendor(hostname) {
   show('vendor-detail'); $('vendor-detail').innerHTML = '<div class="card">Loading ' + esc(hostname) + '…</div>';
   try { const data = await api('/api/vendor/' + encodeURIComponent(hostname)); const vendor = data.vendor || {}; $('vendor-detail').innerHTML = '<div class="card"><h2>' + esc(vendor.hostname || vendor.vendor_primary_hostname || hostname) + '</h2><p>Vendor primary hostname: <strong>' + esc(vendor.vendor_primary_hostname || vendor.hostname || '—') + '</strong></p><p>Score: <strong>' + esc(vendor.score ?? vendor.automated_score ?? '—') + '</strong> · Scanned: ' + esc(vendor.scanned_at || '—') + '</p></div>' + '<div class="card"><h2>Domain scan checks</h2>' + checkTable(data.checkResults || []) + '</div><div class="split"><div class="card"><h2>Active Risks</h2>' + riskTable(data.activeRisks || []) + '</div><div class="card"><h2>Recent Changes</h2>' + eventMiniTable(data.recentChanges || []) + '</div></div><div class="card"><h2>Waived Checks</h2>' + checkTable(data.waivedCheckResults || []) + '</div>'; } catch (error) { $('vendor-detail').innerHTML = renderError('Vendor failed to load', error.message); }
